@@ -54,3 +54,20 @@ Each payload is 28 bytes: seven little-endian `f32` values in this order:
 key expressions; missing names fall back to `id_<n>`. Use
 `--rigid-body-pose-topic-prefix` to change the prefix, or
 `--no-rigid-body-pose-topics` to disable these compact topics.
+
+## Release binaries and schema compatibility
+
+Pushing a `v*` tag builds release archives for Linux, macOS, and Windows and
+uploads them to a GitHub release. The Linux archive is built for
+`x86_64-unknown-linux-musl` to avoid a glibc runtime dependency. The Windows
+archive statically links the MSVC C runtime. The macOS archive contains a
+universal binary for Intel and Apple Silicon Macs.
+
+Each archive contains `synapse-qualisys-bridge`, `README.md`, `LICENSE`, and
+`SYNAPSE_FBS_COMPATIBILITY.txt`. The workflow also publishes a `.sha256`
+checksum for every archive.
+
+The release workflow reads the locked `synapse_fbs` crate version from
+`Cargo.lock`, adds it to the GitHub release notes, and includes it in each
+archive. Consumers should decode Synapse FlatBuffers payloads with the
+documented `synapse_fbs` version for that release.

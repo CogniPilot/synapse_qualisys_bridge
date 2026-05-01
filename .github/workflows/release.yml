@@ -1,0 +1,275 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  BIN_NAME: synapse-qualisys-bridge
+  BRIDGE_DIR: synapse_qualisys_bridge
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            package: linux-x86_64-musl
+            target: x86_64-unknown-linux-musl
+          - name: macOS universal
+            os: macos-latest
+            package: macos-universal
+          - name: Windows x86_64
+            os: windows-latest
+            package: windows-x86_64
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout bridge
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.BRIDGE_DIR }}
+          ref: ${{ github.ref }}
+
+      - name: Checkout Qualisys Rust SDK
+        uses: actions/checkout@v4
+        with:
+          repository: CogniPilot/qualisys_rust_sdk
+          path: qualisys_rust_sdk
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install Linux musl target
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          rustup target add "${{ matrix.target }}"
+
+      - name: Add macOS Rust targets
+        if: runner.os == 'macOS'
+        shell: bash
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Read release metadata
+        id: metadata
+        shell: bash
+        working-directory: ${{ env.BRIDGE_DIR }}
+        run: |
+          set -euo pipefail
+
+          synapse_fbs_version="$(awk '
+            $0 == "[[package]]" { in_package = 0 }
+            $0 == "name = \"synapse_fbs\"" { in_package = 1; next }
+            in_package && $1 == "version" {
+              gsub(/\"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.lock)"
+
+          if [ -z "${synapse_fbs_version}" ]; then
+            echo "Could not determine synapse_fbs version from Cargo.lock" >&2
+            exit 1
+          fi
+
+          release_name="${GITHUB_REF_NAME}"
+          release_name="${release_name//\//-}"
+
+          {
+            echo "synapse_fbs_version=${synapse_fbs_version}"
+            echo "release_name=${release_name}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build Linux binary
+        if: runner.os == 'Linux'
+        shell: bash
+        working-directory: ${{ env.BRIDGE_DIR }}
+        run: cargo build --release --locked --target "${{ matrix.target }}" --bin "${BIN_NAME}"
+
+      - name: Build Windows binary
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: ${{ env.BRIDGE_DIR }}
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked --target "${{ matrix.target }}" --bin "${BIN_NAME}"
+
+      - name: Build universal macOS binary
+        if: runner.os == 'macOS'
+        shell: bash
+        working-directory: ${{ env.BRIDGE_DIR }}
+        run: |
+          set -euo pipefail
+
+          cargo build --release --locked --target x86_64-apple-darwin --bin "${BIN_NAME}"
+          cargo build --release --locked --target aarch64-apple-darwin --bin "${BIN_NAME}"
+          mkdir -p target/release
+          lipo -create \
+            -output "target/release/${BIN_NAME}" \
+            "target/x86_64-apple-darwin/release/${BIN_NAME}" \
+            "target/aarch64-apple-darwin/release/${BIN_NAME}"
+          strip "target/release/${BIN_NAME}"
+
+      - name: Package archive
+        id: package
+        shell: bash
+        working-directory: ${{ env.BRIDGE_DIR }}
+        run: |
+          set -euo pipefail
+
+          archive_base="${BIN_NAME}-${{ steps.metadata.outputs.release_name }}-${{ matrix.package }}"
+          dist_dir="dist/${archive_base}"
+          mkdir -p "${dist_dir}"
+
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            cp "target/${{ matrix.target }}/release/${BIN_NAME}" "${dist_dir}/"
+            strip "${dist_dir}/${BIN_NAME}"
+            chmod +x "${dist_dir}/${BIN_NAME}"
+          elif [ "${RUNNER_OS}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/${BIN_NAME}.exe" "${dist_dir}/"
+          else
+            cp "target/release/${BIN_NAME}" "${dist_dir}/"
+            chmod +x "${dist_dir}/${BIN_NAME}"
+          fi
+
+          cp README.md LICENSE "${dist_dir}/"
+          {
+            echo "${BIN_NAME} ${{ steps.metadata.outputs.release_name }}"
+            echo "Compatible synapse_fbs version: ${{ steps.metadata.outputs.synapse_fbs_version }}"
+            echo
+            echo "This binary was built against the synapse_fbs crate version above."
+            echo "Consumers should decode Synapse FlatBuffers payloads with the same"
+            echo "schema version."
+          } > "${dist_dir}/SYNAPSE_FBS_COMPATIBILITY.txt"
+
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            archive="${archive_base}.zip"
+            powershell -NoProfile -Command "Compress-Archive -Path '${dist_dir}/*' -DestinationPath '${archive}' -Force"
+          else
+            archive="${archive_base}.tar.gz"
+            tar -C "${dist_dir}" -czf "${archive}" .
+          fi
+
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            powershell -NoProfile -Command "(Get-FileHash -Algorithm SHA256 '${archive}').Hash.ToLower() + '  ${archive}' | Set-Content '${archive}.sha256'"
+          else
+            shasum -a 256 "${archive}" > "${archive}.sha256"
+          fi
+
+          {
+            echo "archive=${archive}"
+            echo "checksum=${archive}.sha256"
+            echo "archive_base=${archive_base}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive_base }}
+          path: |
+            ${{ env.BRIDGE_DIR }}/${{ steps.package.outputs.archive }}
+            ${{ env.BRIDGE_DIR }}/${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout bridge
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.BRIDGE_DIR }}
+          ref: ${{ github.ref_name }}
+
+      - name: Read synapse_fbs version
+        id: metadata
+        shell: bash
+        working-directory: ${{ env.BRIDGE_DIR }}
+        run: |
+          set -euo pipefail
+
+          synapse_fbs_version="$(awk '
+            $0 == "[[package]]" { in_package = 0 }
+            $0 == "name = \"synapse_fbs\"" { in_package = 1; next }
+            in_package && $1 == "version" {
+              gsub(/\"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.lock)"
+
+          if [ -z "${synapse_fbs_version}" ]; then
+            echo "Could not determine synapse_fbs version from Cargo.lock" >&2
+            exit 1
+          fi
+
+          echo "synapse_fbs_version=${synapse_fbs_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Upload archives to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+      - name: Update release compatibility notes
+        uses: actions/github-script@v7
+        env:
+          SYNAPSE_FBS_VERSION: ${{ steps.metadata.outputs.synapse_fbs_version }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const tag = context.ref.replace('refs/tags/', '');
+            const { data: release } = await github.rest.repos.getReleaseByTag({
+              owner,
+              repo,
+              tag,
+            });
+
+            const start = '<!-- synapse-fbs-compatibility:start -->';
+            const end = '<!-- synapse-fbs-compatibility:end -->';
+            const section = [
+              start,
+              '## Compatibility',
+              '',
+              `- synapse_fbs: \`${process.env.SYNAPSE_FBS_VERSION}\``,
+              '',
+              'Release archives also include `SYNAPSE_FBS_COMPATIBILITY.txt`.',
+              end,
+            ].join('\n');
+
+            const body = release.body || '';
+            const pattern = new RegExp(`${start}[\\s\\S]*?${end}`, 'm');
+            const nextBody = pattern.test(body)
+              ? body.replace(pattern, section)
+              : [body.trim(), section].filter(Boolean).join('\n\n');
+
+            await github.rest.repos.updateRelease({
+              owner,
+              repo,
+              release_id: release.id,
+              body: nextBody,
+            });
