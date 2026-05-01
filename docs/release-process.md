@@ -13,7 +13,8 @@ The release workflow:
 3. Packages the binaries with `README.md`, `LICENSE`, and
    `SYNAPSE_FBS_COMPATIBILITY.txt`.
 4. Publishes `.sha256` checksums for the archives.
-5. Creates or updates the GitHub release for the tag and uploads the archives.
+5. Creates or updates the GitHub release for the tag with the GitHub CLI and
+   uploads the archives.
 6. Updates the release notes with the locked `synapse_fbs` version from
    `Cargo.lock`.
 
