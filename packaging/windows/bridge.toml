@@ -13,12 +13,13 @@ transport = "udp"
 udp_bind = "0.0.0.0:0"
 
 [zenoh]
-connect = "udp/127.0.0.1:7447"
+mode = "router"
+connect = ""
+listen = "udp/0.0.0.0:7447,tcp/0.0.0.0:7447"
 topic = "synapse/mocap/frame"
 definition_topic = "synapse/mocap/definition"
 rigid_body_pose_topic_prefix = "synapse/mocap/rigid_body"
 no_rigid_body_pose_topics = false
-router_command = "zenohd"
 admin_query_timeout_ms = 1000
 
 [web]

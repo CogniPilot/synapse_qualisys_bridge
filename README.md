@@ -13,19 +13,24 @@ cargo run --bin synapse-qualisys-bridge -- --open
 
 Open <http://127.0.0.1:8787> to start/stop the bridge, edit the main Qualisys
 and Zenoh settings, run a Qualisys connection diagnostic, inspect published
-topic counters, view recent logs, and run best-effort Zenoh admin discovery for
-publishers, subscribers, and queryables.
+topic counters, and view recent logs.
 
-The dashboard can also manage a local Zenoh router process when
-`zenoh.router_command` is configured in `bridge.toml`. The default command is
-`zenohd`, so it works when `zenohd` is available on `PATH`.
+The bridge runs Zenoh in embedded `router` mode by default, so Windows users do
+not need to install `zenohd`. Fresh installs listen on both
+`udp/0.0.0.0:7447` and `tcp/0.0.0.0:7447`; other computers on the network can
+subscribe through `udp/<bridge-pc-ip>:7447` or `tcp/<bridge-pc-ip>:7447`. UDP is
+listed first because it is the preferred low-latency transport for this bridge,
+while TCP remains available as a compatibility fallback.
+
+To join this bridge to another Zenoh router, set `zenoh.connect` to one or more
+upstream endpoints. Set `zenoh.mode = "client"` in `bridge.toml` to publish
+only through an external Zenoh router instead.
 
 Run against a real QTM host:
 
 ```sh
 cargo run --bin synapse-qualisys-bridge -- \
-  --qualisys-host 192.168.1.10 \
-  --zenoh-connect udp/127.0.0.1:7447
+  --qualisys-host 192.168.1.10
 ```
 
 Run against the SDK simulator:
@@ -33,18 +38,27 @@ Run against the SDK simulator:
 ```sh
 cargo run --manifest-path ../qualisys_rust_sdk/Cargo.toml --bin qualisys-sim
 cargo run --bin synapse-qualisys-bridge -- \
-  --qualisys-host 127.0.0.1 \
-  --zenoh-connect udp/127.0.0.1:7447
+  --qualisys-host 127.0.0.1
 ```
 
 Useful defaults can also come from environment variables:
 
 ```sh
-QUALISYS_HOST=127.0.0.1 ZENOH_CONNECT=udp/127.0.0.1:7447 cargo run --bin synapse-qualisys-bridge
+QUALISYS_HOST=127.0.0.1 cargo run --bin synapse-qualisys-bridge
 ```
 
 The default Zenoh key expression is `synapse/mocap/frame`. Run
 `cargo run --bin synapse-qualisys-bridge -- --help` for all options.
+
+Example subscriber configuration from another machine:
+
+```text
+endpoint: udp/<bridge-pc-ip>:7447
+key expression: synapse/mocap/**
+```
+
+`zenoh.listen` and `zenoh.connect` can each contain multiple endpoints separated
+by commas, semicolons, or whitespace.
 
 Write a default configuration file:
 

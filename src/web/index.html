@@ -36,21 +36,32 @@
           <strong id="zenohState">unknown</strong>
           <small id="zenohDetail"></small>
         </article>
-        <article class="status-panel">
-          <span class="label">Router</span>
-          <strong id="routerState">unknown</strong>
-          <small id="routerDetail"></small>
-        </article>
       </section>
 
       <section class="toolbar" aria-label="Runtime controls">
-        <button type="button" data-action="bridge-start">Start Bridge</button>
-        <button type="button" data-action="bridge-stop">Stop Bridge</button>
-        <button type="button" data-action="bridge-restart">Restart Bridge</button>
+        <button id="bridgeToggleButton" type="button">Start Bridge</button>
         <button type="button" data-action="qualisys-diagnostic">Diagnose Qualisys</button>
-        <button type="button" data-action="router-start">Start Zenoh</button>
-        <button type="button" data-action="router-stop">Stop Zenoh</button>
-        <button type="button" data-action="zenoh-discovery">Refresh Network</button>
+      </section>
+
+      <section class="panel subscribe-panel" aria-label="Network subscription">
+        <div class="panel-title">
+          <h2>Network Subscribe</h2>
+          <span id="networkMode" class="subtle"></span>
+        </div>
+        <div class="subscribe-grid">
+          <div>
+            <span class="label">Endpoints</span>
+            <code id="subscriberEndpoint">-</code>
+          </div>
+          <div>
+            <span class="label">Key expression</span>
+            <code id="subscriberKeyExpr">-</code>
+          </div>
+          <div>
+            <span class="label">Subscriber args</span>
+            <code id="subscriberArgs">-</code>
+          </div>
+        </div>
       </section>
 
       <section class="metrics-grid" aria-label="Runtime metrics">
@@ -99,6 +110,18 @@
             <fieldset>
               <legend>Zenoh</legend>
               <label>
+                Mode
+                <select id="zenohMode" name="zenohMode">
+                  <option value="router">Router</option>
+                  <option value="client">Client</option>
+                  <option value="peer">Peer</option>
+                </select>
+              </label>
+              <label>
+                Listen endpoints
+                <input id="zenohListen" name="zenohListen" autocomplete="off" />
+              </label>
+              <label>
                 Connect
                 <input id="zenohConnect" name="zenohConnect" autocomplete="off" />
               </label>
@@ -113,10 +136,6 @@
               <label>
                 Rigid body prefix
                 <input id="posePrefix" name="posePrefix" autocomplete="off" />
-              </label>
-              <label>
-                Router command
-                <input id="routerCommand" name="routerCommand" autocomplete="off" />
               </label>
             </fieldset>
 
@@ -163,46 +182,23 @@
         </section>
       </section>
 
-      <section class="layout">
-        <section class="panel">
-          <div class="panel-title">
-            <h2>Rigid Bodies</h2>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th>ID</th>
-                  <th>Position m</th>
-                  <th>Residual</th>
-                </tr>
-              </thead>
-              <tbody id="rigidBodiesTable"></tbody>
-            </table>
-          </div>
-        </section>
-
-        <section class="panel">
-          <div class="panel-title">
-            <h2>Zenoh Network</h2>
-            <span id="discoveryStatus" class="subtle">Not refreshed</span>
-          </div>
-          <div class="network-grid">
-            <div>
-              <h3>Subscribers</h3>
-              <ul id="subscribersList"></ul>
-            </div>
-            <div>
-              <h3>Publishers</h3>
-              <ul id="publishersList"></ul>
-            </div>
-            <div>
-              <h3>Queryables</h3>
-              <ul id="queryablesList"></ul>
-            </div>
-          </div>
-        </section>
+      <section class="panel">
+        <div class="panel-title">
+          <h2>Rigid Bodies</h2>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>ID</th>
+                <th>Position m</th>
+                <th>Residual</th>
+              </tr>
+            </thead>
+            <tbody id="rigidBodiesTable"></tbody>
+          </table>
+        </div>
       </section>
 
       <section class="panel">

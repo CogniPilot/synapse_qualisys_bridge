@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::mem::size_of;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -50,12 +50,13 @@ converts selected mocap components into synapse.topic.MocapFrame FlatBuffers, an
 Examples:
   synapse-qualisys-bridge --open
   synapse-qualisys-bridge --config bridge.toml --open
-  synapse-qualisys-bridge --qualisys-host 192.168.1.10 --zenoh-connect udp/127.0.0.1:7447
+  synapse-qualisys-bridge --qualisys-host 192.168.1.10
 
 Environment:
   SYNAPSE_QUALISYS_BRIDGE_CONFIG
   QUALISYS_HOST, QUALISYS_PORT, QUALISYS_TIMEOUT_MS
-  ZENOH_CONNECT, ZENOH_TOPIC, ZENOH_DEFINITION_TOPIC
+  ZENOH_MODE, ZENOH_CONNECT, ZENOH_LISTEN
+  ZENOH_TOPIC, ZENOH_DEFINITION_TOPIC
   ZENOH_RIGID_BODY_POSE_TOPIC_PREFIX, ZENOH_NO_RIGID_BODY_POSE_TOPICS
   MOCAP_INCLUDE"
 )]
@@ -167,12 +168,29 @@ enum MocapData {
 #[command(next_help_heading = "Zenoh")]
 struct ZenohArgs {
     #[arg(
+        long = "zenoh-mode",
+        env = "ZENOH_MODE",
+        value_enum,
+        value_name = "MODE",
+        help = "Zenoh runtime mode: router, client, or peer"
+    )]
+    zenoh_mode: Option<ZenohMode>,
+
+    #[arg(
         long = "zenoh-connect",
         env = "ZENOH_CONNECT",
         value_name = "LOCATOR",
-        help = "Zenoh router locator"
+        help = "Zenoh router locator or upstream router endpoint. Repeat endpoints with commas."
     )]
     zenoh_connect: Option<String>,
+
+    #[arg(
+        long = "zenoh-listen",
+        env = "ZENOH_LISTEN",
+        value_name = "LOCATOR",
+        help = "Zenoh listen endpoint used in router or peer mode. Repeat endpoints with commas."
+    )]
+    zenoh_listen: Option<String>,
 
     #[arg(
         long = "topic",
@@ -324,25 +342,45 @@ impl Default for StreamConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct ZenohConfig {
+    mode: ZenohMode,
     connect: String,
+    listen: String,
     topic: String,
     definition_topic: String,
     rigid_body_pose_topic_prefix: String,
     no_rigid_body_pose_topics: bool,
-    router_command: Option<String>,
     admin_query_timeout_ms: u64,
 }
 
 impl Default for ZenohConfig {
     fn default() -> Self {
         Self {
-            connect: "udp/127.0.0.1:7447".to_owned(),
+            mode: ZenohMode::Router,
+            connect: String::new(),
+            listen: "udp/0.0.0.0:7447,tcp/0.0.0.0:7447".to_owned(),
             topic: "synapse/mocap/frame".to_owned(),
             definition_topic: "synapse/mocap/definition".to_owned(),
             rigid_body_pose_topic_prefix: "synapse/mocap/rigid_body".to_owned(),
             no_rigid_body_pose_topics: false,
-            router_command: Some("zenohd".to_owned()),
             admin_query_timeout_ms: 1_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ZenohMode {
+    Router,
+    Client,
+    Peer,
+}
+
+impl ZenohMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            ZenohMode::Router => "router",
+            ZenohMode::Client => "client",
+            ZenohMode::Peer => "peer",
         }
     }
 }
@@ -428,7 +466,7 @@ struct AppInner {
     config_path: PathBuf,
     log_path: PathBuf,
     bridge_worker: Mutex<Option<BridgeWorker>>,
-    router_process: Mutex<Option<Child>>,
+    zenoh_session: Mutex<Option<zenoh::Session>>,
 }
 
 #[derive(Debug, Clone)]
@@ -442,7 +480,7 @@ impl AppHandle {
             config_path,
             log_path,
             bridge_worker: Mutex::new(None),
-            router_process: Mutex::new(None),
+            zenoh_session: Mutex::new(None),
         }))
     }
 
@@ -453,12 +491,12 @@ impl AppHandle {
     fn replace_config(&self, config: AppConfig) -> Result<()> {
         save_config(&self.0.config_path, &config)?;
         *self.0.config.write().expect("config lock poisoned") = config;
+        self.close_zenoh_session()?;
         self.log("info", "Configuration saved");
         Ok(())
     }
 
     fn snapshot(&self) -> AppSnapshot {
-        self.refresh_router_status();
         let config = self.config();
         let state = self.0.state.lock().expect("state lock poisoned");
         AppSnapshot {
@@ -470,7 +508,7 @@ impl AppHandle {
             bridge: state.bridge.clone(),
             qualisys: state.qualisys.clone(),
             zenoh: state.zenoh.clone(),
-            router: state.router.clone(),
+            zenoh_access: zenoh_access(&config),
             stats: state.stats.clone(),
             topics: state.topics.values().cloned().collect(),
             rigid_bodies: state.rigid_bodies.clone(),
@@ -502,12 +540,6 @@ impl AppHandle {
     fn set_zenoh_status(&self, state: &str, detail: impl Into<String>, error: Option<String>) {
         self.update_state(|app| {
             app.zenoh = ComponentStatus::new(state, detail, error);
-        });
-    }
-
-    fn set_router_status(&self, state: &str, detail: impl Into<String>, error: Option<String>) {
-        self.update_state(|app| {
-            app.router = ComponentStatus::new(state, detail, error);
         });
     }
 
@@ -658,94 +690,6 @@ impl AppHandle {
         self.start_bridge()
     }
 
-    fn start_zenoh_router(&self) -> Result<bool> {
-        let command =
-            self.config().zenoh.router_command.ok_or_else(|| {
-                BridgeError::Config("Zenoh router command is not configured".into())
-            })?;
-
-        let mut process = self.0.router_process.lock().expect("router lock poisoned");
-        if let Some(child) = process.as_mut() {
-            if child
-                .try_wait()
-                .map_err(|error| BridgeError::Io(error))?
-                .is_none()
-            {
-                return Ok(false);
-            }
-        }
-
-        let child = spawn_shell_command(&command)?;
-        *process = Some(child);
-        self.set_router_status("running", format!("Started `{command}`"), None);
-        self.log("info", format!("Started Zenoh router command: {command}"));
-        Ok(true)
-    }
-
-    fn stop_zenoh_router(&self) -> Result<bool> {
-        let mut process = self.0.router_process.lock().expect("router lock poisoned");
-        let Some(mut child) = process.take() else {
-            self.set_router_status(
-                "unknown",
-                "No managed Zenoh router process is running",
-                None,
-            );
-            return Ok(false);
-        };
-        match child.kill() {
-            Ok(()) => {
-                let _ = child.wait();
-                self.set_router_status("stopped", "Managed Zenoh router stopped", None);
-                self.log("info", "Stopped managed Zenoh router");
-                Ok(true)
-            }
-            Err(error) => {
-                let message = error.to_string();
-                self.set_router_status(
-                    "error",
-                    "Failed to stop managed Zenoh router",
-                    Some(message),
-                );
-                Ok(false)
-            }
-        }
-    }
-
-    fn refresh_router_status(&self) {
-        let mut process = self.0.router_process.lock().expect("router lock poisoned");
-        if let Some(child) = process.as_mut() {
-            match child.try_wait() {
-                Ok(None) => {
-                    self.set_router_status("running", "Managed Zenoh router is running", None)
-                }
-                Ok(Some(status)) => {
-                    *process = None;
-                    self.set_router_status(
-                        "stopped",
-                        format!("Managed Zenoh router exited with {status}"),
-                        None,
-                    );
-                }
-                Err(error) => self.set_router_status(
-                    "error",
-                    "Failed to inspect managed Zenoh router",
-                    Some(error.to_string()),
-                ),
-            }
-        } else if self.config().zenoh.router_command.is_some() {
-            let current = self
-                .0
-                .state
-                .lock()
-                .expect("state lock poisoned")
-                .router
-                .clone();
-            if current.state == "unknown" {
-                self.set_router_status("stopped", "Managed router is not running", None);
-            }
-        }
-    }
-
     fn run_qualisys_diagnostic(&self) -> QualisysDiagnostic {
         let config = self.config();
         match diagnose_qualisys(&config) {
@@ -790,8 +734,7 @@ impl AppHandle {
     }
 
     fn discover_zenoh(&self) -> ZenohDiscovery {
-        let config = self.config();
-        match discover_zenoh(&config) {
+        match discover_zenoh(self) {
             Ok(discovery) => {
                 self.set_zenoh_status("connected", "Zenoh admin discovery completed", None);
                 discovery
@@ -810,6 +753,51 @@ impl AppHandle {
                     errors: vec![error.to_string()],
                 }
             }
+        }
+    }
+
+    fn ensure_zenoh_session(&self) -> Result<zenoh::Session> {
+        let mut session = self
+            .0
+            .zenoh_session
+            .lock()
+            .expect("zenoh session lock poisoned");
+        if let Some(existing) = session.as_ref() {
+            return Ok(existing.clone());
+        }
+
+        let config = self.config();
+        self.set_zenoh_status(
+            "starting",
+            format!("Starting Zenoh {} mode", config.zenoh.mode.as_str()),
+            None,
+        );
+        let opened = zenoh::open(zenoh_config(&config)?)
+            .wait()
+            .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
+        let detail = zenoh_status_detail(&config);
+        self.set_zenoh_status("running", detail.clone(), None);
+        self.log("info", detail);
+        *session = Some(opened.clone());
+        Ok(opened)
+    }
+
+    fn close_zenoh_session(&self) -> Result<bool> {
+        let session = self
+            .0
+            .zenoh_session
+            .lock()
+            .expect("zenoh session lock poisoned")
+            .take();
+        if let Some(session) = session {
+            session
+                .close()
+                .wait()
+                .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
+            self.set_zenoh_status("stopped", "Zenoh session stopped", None);
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
@@ -876,7 +864,7 @@ struct AppSnapshot {
     bridge: ComponentStatus,
     qualisys: ComponentStatus,
     zenoh: ComponentStatus,
-    router: ComponentStatus,
+    zenoh_access: ZenohAccess,
     stats: BridgeStats,
     topics: Vec<TopicStats>,
     rigid_bodies: Vec<RigidBodyStatus>,
@@ -890,6 +878,20 @@ struct ComponentStatus {
     detail: String,
     last_error: Option<String>,
     updated_at_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ZenohAccess {
+    mode: String,
+    listen: String,
+    connect: String,
+    subscriber_endpoint: Option<String>,
+    subscriber_endpoints: Vec<String>,
+    frame_topic: String,
+    definition_topic: String,
+    rigid_body_topic_prefix: String,
+    sample_key_expr: String,
+    example_subscriber_args: Option<String>,
 }
 
 impl ComponentStatus {
@@ -974,7 +976,6 @@ struct AppState {
     bridge: ComponentStatus,
     qualisys: ComponentStatus,
     zenoh: ComponentStatus,
-    router: ComponentStatus,
     stats: BridgeStats,
     topics: BTreeMap<String, TopicStats>,
     rigid_bodies: Vec<RigidBodyStatus>,
@@ -990,7 +991,6 @@ impl AppState {
             bridge: ComponentStatus::new("stopped", "Bridge is stopped", None),
             qualisys: ComponentStatus::new("unknown", "No Qualisys connection attempted", None),
             zenoh: ComponentStatus::new("unknown", "No Zenoh connection attempted", None),
-            router: ComponentStatus::new("unknown", "Managed router not inspected", None),
             stats: BridgeStats::default(),
             topics: BTreeMap::new(),
             rigid_bodies: Vec::new(),
@@ -1129,8 +1129,14 @@ fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
     if cli.stream.udp_destination.is_some() {
         config.stream.udp_destination = cli.stream.udp_destination;
     }
+    if let Some(mode) = cli.zenoh.zenoh_mode {
+        config.zenoh.mode = mode;
+    }
     if let Some(connect) = cli.zenoh.zenoh_connect.as_ref() {
         config.zenoh.connect = connect.clone();
+    }
+    if let Some(listen) = cli.zenoh.zenoh_listen.as_ref() {
+        config.zenoh.listen = listen.clone();
     }
     if let Some(topic) = cli.zenoh.topic.as_ref() {
         config.zenoh.topic = topic.clone();
@@ -1177,11 +1183,15 @@ fn run_bridge_loop(app: AppHandle, stop: Arc<AtomicBool>) {
                         "Qualisys connection or stream failed",
                         Some(error.to_string()),
                     ),
-                    BridgeError::Zenoh(_) => app.set_zenoh_status(
-                        "error",
-                        "Zenoh connection or publish failed",
-                        Some(error.to_string()),
-                    ),
+                    BridgeError::Zenoh(_) => {
+                        let message = error.to_string();
+                        let _ = app.close_zenoh_session();
+                        app.set_zenoh_status(
+                            "error",
+                            "Zenoh connection or publish failed",
+                            Some(message),
+                        );
+                    }
                     _ => {}
                 }
                 app.set_bridge_status("retrying", "Bridge will retry", Some(error.to_string()));
@@ -1199,25 +1209,12 @@ fn run_bridge_loop(app: AppHandle, stop: Arc<AtomicBool>) {
 
     app.set_bridge_status("stopped", "Bridge stopped", None);
     app.set_qualisys_status("unknown", "Bridge stopped", None);
-    app.set_zenoh_status("unknown", "Bridge stopped", None);
     app.log("info", "Bridge thread stopped");
 }
 
 fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Result<()> {
     app.set_bridge_status("starting", "Opening Zenoh session", None);
-    app.set_zenoh_status(
-        "connecting",
-        format!("Connecting to {}", config.zenoh.connect),
-        None,
-    );
-    let session = zenoh::open(zenoh_config(config)?)
-        .wait()
-        .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
-    app.set_zenoh_status(
-        "connected",
-        format!("Connected to {}", config.zenoh.connect),
-        None,
-    );
+    let session = app.ensure_zenoh_session()?;
 
     let publisher = session
         .declare_publisher(config.zenoh.topic.clone())
@@ -1272,8 +1269,11 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
     app.log(
         "info",
         format!(
-            "Bridge running: QTM {}:{}, Zenoh {}, topic {}",
-            config.qualisys.host, config.qualisys.port, config.zenoh.connect, config.zenoh.topic
+            "Bridge running: QTM {}:{}, {}, topic {}",
+            config.qualisys.host,
+            config.qualisys.port,
+            zenoh_status_detail(config),
+            config.zenoh.topic
         ),
     );
 
@@ -1323,18 +1323,155 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
 fn zenoh_config(config: &AppConfig) -> Result<Config> {
     let mut zenoh_config = Config::default();
     zenoh_config
-        .insert_json5("mode", "\"client\"")
+        .insert_json5("mode", &format!("\"{}\"", config.zenoh.mode.as_str()))
         .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
-    zenoh_config
-        .insert_json5(
-            "connect/endpoints",
-            &format!("[\"{}\"]", config.zenoh.connect),
-        )
-        .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
+
+    let connect = endpoint_list(&config.zenoh.connect);
+    if !connect.is_empty() {
+        zenoh_config
+            .insert_json5(
+                "connect/endpoints",
+                &serde_json::to_string(&connect)
+                    .map_err(|error| BridgeError::Zenoh(error.to_string()))?,
+            )
+            .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
+    }
+
+    let listen = endpoint_list(&config.zenoh.listen);
+    if !listen.is_empty() && !matches!(config.zenoh.mode, ZenohMode::Client) {
+        zenoh_config
+            .insert_json5(
+                "listen/endpoints",
+                &serde_json::to_string(&listen)
+                    .map_err(|error| BridgeError::Zenoh(error.to_string()))?,
+            )
+            .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
+    }
+
     zenoh_config
         .insert_json5("scouting/multicast/enabled", "false")
         .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
     Ok(zenoh_config)
+}
+
+fn endpoint_list(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+        .filter_map(|part| {
+            let endpoint = part.trim();
+            (!endpoint.is_empty()).then(|| endpoint.to_owned())
+        })
+        .collect()
+}
+
+fn zenoh_access(config: &AppConfig) -> ZenohAccess {
+    let subscriber_endpoints = match config.zenoh.mode {
+        ZenohMode::Client => endpoint_list(&config.zenoh.connect),
+        ZenohMode::Router | ZenohMode::Peer => advertised_zenoh_endpoints(&config.zenoh.listen),
+    };
+    let subscriber_endpoint = subscriber_endpoints.first().cloned();
+    let sample_key_expr = subscription_key_expr(config);
+    let example_subscriber_args = subscriber_endpoint
+        .as_ref()
+        .map(|endpoint| format!("-e {endpoint} -k '{sample_key_expr}'"));
+
+    ZenohAccess {
+        mode: config.zenoh.mode.as_str().to_owned(),
+        listen: config.zenoh.listen.clone(),
+        connect: config.zenoh.connect.clone(),
+        subscriber_endpoint,
+        subscriber_endpoints,
+        frame_topic: config.zenoh.topic.clone(),
+        definition_topic: config.zenoh.definition_topic.clone(),
+        rigid_body_topic_prefix: config.zenoh.rigid_body_pose_topic_prefix.clone(),
+        sample_key_expr,
+        example_subscriber_args,
+    }
+}
+
+fn advertised_zenoh_endpoints(listen: &str) -> Vec<String> {
+    let host = local_network_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "<bridge-pc-ip>".to_owned());
+    endpoint_list(listen)
+        .into_iter()
+        .map(|endpoint| {
+            endpoint
+                .replace("0.0.0.0", &host)
+                .replace("[::]", &host)
+                .replace("::", &host)
+                .replace("127.0.0.1", &host)
+                .replace("localhost", &host)
+        })
+        .collect()
+}
+
+fn local_network_ip() -> Option<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback()).then_some(ip)
+}
+
+fn subscription_key_expr(config: &AppConfig) -> String {
+    let topics = [
+        config.zenoh.topic.as_str(),
+        config.zenoh.definition_topic.as_str(),
+        config.zenoh.rigid_body_pose_topic_prefix.as_str(),
+    ];
+    let parts: Vec<Vec<&str>> = topics
+        .iter()
+        .map(|topic| topic.trim_matches('/').split('/').collect())
+        .filter(|parts: &Vec<&str>| !parts.is_empty())
+        .collect();
+
+    let Some(first) = parts.first() else {
+        return "**".to_owned();
+    };
+
+    let mut shared = Vec::new();
+    for (index, part) in first.iter().enumerate() {
+        if parts
+            .iter()
+            .all(|candidate| candidate.get(index).is_some_and(|value| value == part))
+        {
+            shared.push(*part);
+        } else {
+            break;
+        }
+    }
+
+    if shared.is_empty() {
+        config.zenoh.topic.clone()
+    } else {
+        format!("{}/**", shared.join("/"))
+    }
+}
+
+fn zenoh_status_detail(config: &AppConfig) -> String {
+    let listen = endpoint_list(&config.zenoh.listen).join(", ");
+    let connect = endpoint_list(&config.zenoh.connect).join(", ");
+    match config.zenoh.mode {
+        ZenohMode::Router => format!(
+            "Zenoh router mode listening on {}{}",
+            listen,
+            if connect.is_empty() {
+                String::new()
+            } else {
+                format!(", connected to {}", connect)
+            }
+        ),
+        ZenohMode::Peer => format!(
+            "Zenoh peer mode listening on {}{}",
+            listen,
+            if connect.is_empty() {
+                String::new()
+            } else {
+                format!(", connected to {}", connect)
+            }
+        ),
+        ZenohMode::Client => format!("Zenoh client mode connected to {}", connect),
+    }
 }
 
 fn connect_qualisys(config: &AppConfig) -> Result<Client> {
@@ -1906,24 +2043,6 @@ fn handle_request(app: AppHandle, mut request: Request) {
                 message: "Bridge restart requested".to_owned(),
             })
         }
-        (Method::Post, "/api/zenoh/router/start") => match app.start_zenoh_router() {
-            Ok(true) => json_response(&MessageResponse {
-                message: "Managed Zenoh router start requested".to_owned(),
-            }),
-            Ok(false) => json_response(&MessageResponse {
-                message: "Managed Zenoh router is already running".to_owned(),
-            }),
-            Err(error) => error_response(StatusCode(400), &error.to_string()),
-        },
-        (Method::Post, "/api/zenoh/router/stop") => match app.stop_zenoh_router() {
-            Ok(true) => json_response(&MessageResponse {
-                message: "Managed Zenoh router stopped".to_owned(),
-            }),
-            Ok(false) => json_response(&MessageResponse {
-                message: "No managed Zenoh router was running".to_owned(),
-            }),
-            Err(error) => error_response(StatusCode(400), &error.to_string()),
-        },
         (Method::Get, "/api/zenoh/discovery") => json_response(&app.discover_zenoh()),
         (Method::Post, "/api/diagnostics/qualisys") => {
             json_response(&app.run_qualisys_diagnostic())
@@ -2008,10 +2127,9 @@ fn diagnose_qualisys(config: &AppConfig) -> Result<QualisysDiagnostic> {
     })
 }
 
-fn discover_zenoh(config: &AppConfig) -> Result<ZenohDiscovery> {
-    let session = zenoh::open(zenoh_config(config)?)
-        .wait()
-        .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
+fn discover_zenoh(app: &AppHandle) -> Result<ZenohDiscovery> {
+    let config = app.config();
+    let session = app.ensure_zenoh_session()?;
     let timeout = Duration::from_millis(config.zenoh.admin_query_timeout_ms);
     let mut errors = Vec::new();
     let subscribers = query_zenoh_admin(&session, "@/**/subscriber/**", timeout, &mut errors);
@@ -2290,14 +2408,6 @@ fn open_browser(url: &str) {
         Command::new("xdg-open").arg(url).spawn()
     };
     let _ = result;
-}
-
-fn spawn_shell_command(command: &str) -> Result<Child> {
-    if cfg!(windows) {
-        Ok(Command::new("cmd").args(["/C", command]).spawn()?)
-    } else {
-        Ok(Command::new("sh").args(["-c", command]).spawn()?)
-    }
 }
 
 fn sleep_stop_aware(stop: &AtomicBool, duration: Duration) {

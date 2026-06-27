@@ -1,5 +1,6 @@
 const state = {
   config: null,
+  snapshot: null,
   toastTimer: null,
 };
 
@@ -68,20 +69,31 @@ function renderStatus(snapshot) {
   setStatus("bridge", snapshot.bridge);
   setStatus("qualisys", snapshot.qualisys);
   setStatus("zenoh", snapshot.zenoh);
-  setStatus("router", snapshot.router);
 
   $("framesMetric").textContent = fmtInt(snapshot.stats.frames);
   $("fpsMetric").textContent = fmtFloat(snapshot.stats.frames_per_second);
   $("messagesMetric").textContent = fmtInt(snapshot.stats.published_messages);
   $("bytesMetric").textContent = fmtBytes(snapshot.stats.published_bytes);
 
+  renderNetworkSubscribe(snapshot.zenoh_access);
   renderTopics(snapshot.topics || []);
   renderRigidBodies(snapshot.rigid_bodies || []);
   renderLogs(snapshot.logs || []);
+  updateBridgeToggle(snapshot.bridge.state);
 
   const installButton = $("installUpdateButton");
   installButton.disabled = !snapshot.update.available;
   installButton.textContent = snapshot.update.available ? "Install Update" : "No Update";
+}
+
+function renderNetworkSubscribe(access) {
+  $("networkMode").textContent = access ? access.mode : "";
+  const endpoints = access?.subscriber_endpoints || [];
+  $("subscriberEndpoint").textContent = endpoints.length
+    ? endpoints.join(", ")
+    : "Set a listen or connect endpoint";
+  $("subscriberKeyExpr").textContent = access?.sample_key_expr || "-";
+  $("subscriberArgs").textContent = access?.example_subscriber_args || "-";
 }
 
 function renderTopics(topics) {
@@ -149,29 +161,21 @@ function row(values) {
   return tr;
 }
 
-function fillList(id, entries) {
-  const list = $(id);
-  list.replaceChildren();
-  if (!entries.length) {
-    const item = document.createElement("li");
-    item.textContent = "No entries returned";
-    list.append(item);
-    return;
-  }
-  for (const entry of entries) {
-    const item = document.createElement("li");
-    item.textContent = entry.key_expr;
-    list.append(item);
-  }
-}
-
 async function refreshStatus() {
   try {
     const snapshot = await request("/api/status");
+    state.snapshot = snapshot;
     renderStatus(snapshot);
   } catch (error) {
     toast(error.message);
   }
+}
+
+function updateBridgeToggle(bridgeState) {
+  const button = $("bridgeToggleButton");
+  const running = ["running", "starting", "retrying", "stopping"].includes(bridgeState);
+  button.dataset.nextAction = running ? "stop" : "start";
+  button.textContent = running ? "Stop Bridge" : "Start Bridge";
 }
 
 async function loadConfig() {
@@ -180,11 +184,12 @@ async function loadConfig() {
   $("qualisysHost").value = cfg.qualisys.host;
   $("qualisysPort").value = cfg.qualisys.port;
   $("qualisysTimeout").value = cfg.qualisys.timeout_ms;
+  $("zenohMode").value = cfg.zenoh.mode;
+  $("zenohListen").value = cfg.zenoh.listen;
   $("zenohConnect").value = cfg.zenoh.connect;
   $("zenohTopic").value = cfg.zenoh.topic;
   $("definitionTopic").value = cfg.zenoh.definition_topic;
   $("posePrefix").value = cfg.zenoh.rigid_body_pose_topic_prefix;
-  $("routerCommand").value = cfg.zenoh.router_command || "";
   $("transport").value = cfg.stream.transport;
   $("udpBind").value = cfg.stream.udp_bind;
 
@@ -198,11 +203,12 @@ function readConfigForm() {
   cfg.qualisys.host = $("qualisysHost").value.trim();
   cfg.qualisys.port = Number($("qualisysPort").value);
   cfg.qualisys.timeout_ms = Number($("qualisysTimeout").value);
+  cfg.zenoh.mode = $("zenohMode").value;
+  cfg.zenoh.listen = $("zenohListen").value.trim();
   cfg.zenoh.connect = $("zenohConnect").value.trim();
   cfg.zenoh.topic = $("zenohTopic").value.trim();
   cfg.zenoh.definition_topic = $("definitionTopic").value.trim();
   cfg.zenoh.rigid_body_pose_topic_prefix = $("posePrefix").value.trim();
-  cfg.zenoh.router_command = $("routerCommand").value.trim() || null;
   cfg.stream.transport = $("transport").value;
   cfg.stream.udp_bind = $("udpBind").value.trim();
   cfg.stream.include = Array.from(document.querySelectorAll("input[name='include']:checked")).map(
@@ -234,18 +240,6 @@ async function diagnoseQualisys() {
   await refreshStatus();
 }
 
-async function refreshDiscovery() {
-  $("discoveryStatus").textContent = "Refreshing...";
-  const discovery = await request("/api/zenoh/discovery");
-  fillList("subscribersList", discovery.subscribers || []);
-  fillList("publishersList", discovery.publishers || []);
-  fillList("queryablesList", discovery.queryables || []);
-  $("discoveryStatus").textContent = discovery.ok
-    ? "Admin discovery OK"
-    : (discovery.errors || []).join(" | ") || "Discovery unavailable";
-  await refreshStatus();
-}
-
 async function checkUpdates() {
   const update = await post("/api/updates/check");
   toast(update.message || "Update check complete");
@@ -264,26 +258,15 @@ function bindEvents() {
   $("checkUpdatesButton").addEventListener("click", () => checkUpdates().catch((e) => toast(e.message)));
   $("installUpdateButton").addEventListener("click", () => installUpdate().catch((e) => toast(e.message)));
 
-  document.querySelector("[data-action='bridge-start']").addEventListener("click", () =>
-    action("/api/bridge/start", "Bridge start requested").catch((e) => toast(e.message)),
-  );
-  document.querySelector("[data-action='bridge-stop']").addEventListener("click", () =>
-    action("/api/bridge/stop", "Bridge stop requested").catch((e) => toast(e.message)),
-  );
-  document.querySelector("[data-action='bridge-restart']").addEventListener("click", () =>
-    action("/api/bridge/restart", "Bridge restart requested").catch((e) => toast(e.message)),
-  );
-  document.querySelector("[data-action='router-start']").addEventListener("click", () =>
-    action("/api/zenoh/router/start", "Zenoh start requested").catch((e) => toast(e.message)),
-  );
-  document.querySelector("[data-action='router-stop']").addEventListener("click", () =>
-    action("/api/zenoh/router/stop", "Zenoh stop requested").catch((e) => toast(e.message)),
-  );
+  $("bridgeToggleButton").addEventListener("click", () => {
+    const nextAction = $("bridgeToggleButton").dataset.nextAction || "start";
+    const path = nextAction === "stop" ? "/api/bridge/stop" : "/api/bridge/start";
+    const message = nextAction === "stop" ? "Bridge stop requested" : "Bridge start requested";
+    action(path, message).catch((e) => toast(e.message));
+  });
+
   document.querySelector("[data-action='qualisys-diagnostic']").addEventListener("click", () =>
     diagnoseQualisys().catch((e) => toast(e.message)),
-  );
-  document.querySelector("[data-action='zenoh-discovery']").addEventListener("click", () =>
-    refreshDiscovery().catch((e) => toast(e.message)),
   );
 }
 

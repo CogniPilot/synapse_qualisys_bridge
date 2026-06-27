@@ -15,7 +15,9 @@ The release workflow:
    default `bridge.toml`.
 4. Builds a Windows Inno Setup installer that installs the bridge, Start Menu
    shortcuts, a preserved per-user `bridge.toml`, and an optional login startup
-   shortcut.
+   shortcut. The installed bridge runs Zenoh in embedded router mode by default,
+   listens on UDP and TCP port 7447 by default, and does not need to bundle
+   `zenohd`.
 5. Publishes `.sha256` checksums for the archives and installer.
 6. Creates or updates the GitHub release for the tag with the GitHub CLI and
    uploads the archives.

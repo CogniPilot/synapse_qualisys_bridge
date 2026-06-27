@@ -126,7 +126,7 @@ button:active {
 }
 
 .status-grid {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .metrics-grid {
@@ -165,6 +165,29 @@ button:active {
   min-height: 18px;
   color: var(--muted);
   overflow-wrap: anywhere;
+}
+
+.subscribe-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(220px, 0.7fr) minmax(320px, 1.5fr);
+  gap: 10px;
+}
+
+.subscribe-grid > div {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+code {
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
 }
 
 .label {
@@ -403,7 +426,8 @@ ol {
 
 @media (max-width: 1100px) {
   .status-grid,
-  .metrics-grid {
+  .metrics-grid,
+  .subscribe-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -426,6 +450,7 @@ ol {
 
   .status-grid,
   .metrics-grid,
+  .subscribe-grid,
   fieldset,
   .check-row,
   .network-grid {
