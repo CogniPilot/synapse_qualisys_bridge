@@ -1,0 +1,37 @@
+[bridge]
+autostart = true
+reconnect_delay_ms = 2000
+
+[qualisys]
+host = "127.0.0.1"
+port = 22223
+timeout_ms = 5000
+
+[stream]
+include = ["rigid-bodies"]
+transport = "udp"
+udp_bind = "0.0.0.0:0"
+
+[zenoh]
+connect = "udp/127.0.0.1:7447"
+topic = "synapse/mocap/frame"
+definition_topic = "synapse/mocap/definition"
+rigid_body_pose_topic_prefix = "synapse/mocap/rigid_body"
+no_rigid_body_pose_topics = false
+router_command = "zenohd"
+admin_query_timeout_ms = 1000
+
+[web]
+enabled = true
+bind = "127.0.0.1:8787"
+open_browser = true
+
+[logging]
+
+[updates]
+enabled = true
+auto_check = true
+auto_install = true
+check_interval_minutes = 360
+github_owner = "CogniPilot"
+github_repo = "synapse_qualisys_bridge"

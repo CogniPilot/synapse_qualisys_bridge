@@ -65,6 +65,11 @@ jobs:
         shell: bash
         run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: choco install innosetup --no-progress -y
+
       - name: Read release metadata
         id: metadata
         shell: bash
@@ -148,6 +153,9 @@ jobs:
           fi
 
           cp README.md LICENSE "${dist_dir}/"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            cp packaging/windows/bridge.toml "${dist_dir}/"
+          fi
           {
             echo "${BIN_NAME} ${{ steps.metadata.outputs.release_name }}"
             echo "Compatible synapse_fbs version: ${{ steps.metadata.outputs.synapse_fbs_version }}"
@@ -177,6 +185,27 @@ jobs:
             echo "archive_base=${archive_base}"
           } >> "${GITHUB_OUTPUT}"
 
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        id: windows_installer
+        shell: powershell
+        working-directory: ${{ env.BRIDGE_DIR }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sourceDir = (Resolve-Path "dist/${{ steps.package.outputs.archive_base }}").Path
+          $outputDir = (Resolve-Path ".").Path
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc `
+            "/DVersion=${{ steps.metadata.outputs.release_name }}" `
+            "/DSourceDir=$sourceDir" `
+            "/DOutputDir=$outputDir" `
+            "packaging/windows/synapse-qualisys-bridge.iss"
+
+          $installer = "synapse-qualisys-bridge-${{ steps.metadata.outputs.release_name }}-windows-x86_64-setup.exe"
+          (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLower() + "  $installer" | Set-Content "$installer.sha256"
+          "installer=$installer" >> $env:GITHUB_OUTPUT
+          "checksum=$installer.sha256" >> $env:GITHUB_OUTPUT
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -184,6 +213,16 @@ jobs:
           path: |
             ${{ env.BRIDGE_DIR }}/${{ steps.package.outputs.archive }}
             ${{ env.BRIDGE_DIR }}/${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+
+      - name: Upload Windows installer artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive_base }}-installer
+          path: |
+            ${{ env.BRIDGE_DIR }}/${{ steps.windows_installer.outputs.installer }}
+            ${{ env.BRIDGE_DIR }}/${{ steps.windows_installer.outputs.checksum }}
           if-no-files-found: error
 
   publish:

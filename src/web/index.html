@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Synapse Qualisys Bridge</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Synapse Qualisys Bridge</h1>
+        <p id="versionLine">Starting...</p>
+      </div>
+      <div class="top-actions">
+        <button id="openLogsButton" type="button">Refresh</button>
+        <button id="checkUpdatesButton" type="button">Check Updates</button>
+        <button id="installUpdateButton" type="button">Install Update</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="status-grid" aria-label="Connection status">
+        <article class="status-panel">
+          <span class="label">Bridge</span>
+          <strong id="bridgeState">unknown</strong>
+          <small id="bridgeDetail"></small>
+        </article>
+        <article class="status-panel">
+          <span class="label">Qualisys</span>
+          <strong id="qualisysState">unknown</strong>
+          <small id="qualisysDetail"></small>
+        </article>
+        <article class="status-panel">
+          <span class="label">Zenoh</span>
+          <strong id="zenohState">unknown</strong>
+          <small id="zenohDetail"></small>
+        </article>
+        <article class="status-panel">
+          <span class="label">Router</span>
+          <strong id="routerState">unknown</strong>
+          <small id="routerDetail"></small>
+        </article>
+      </section>
+
+      <section class="toolbar" aria-label="Runtime controls">
+        <button type="button" data-action="bridge-start">Start Bridge</button>
+        <button type="button" data-action="bridge-stop">Stop Bridge</button>
+        <button type="button" data-action="bridge-restart">Restart Bridge</button>
+        <button type="button" data-action="qualisys-diagnostic">Diagnose Qualisys</button>
+        <button type="button" data-action="router-start">Start Zenoh</button>
+        <button type="button" data-action="router-stop">Stop Zenoh</button>
+        <button type="button" data-action="zenoh-discovery">Refresh Network</button>
+      </section>
+
+      <section class="metrics-grid" aria-label="Runtime metrics">
+        <div>
+          <span class="label">Frames</span>
+          <strong id="framesMetric">0</strong>
+        </div>
+        <div>
+          <span class="label">Frames/sec</span>
+          <strong id="fpsMetric">0.0</strong>
+        </div>
+        <div>
+          <span class="label">Messages</span>
+          <strong id="messagesMetric">0</strong>
+        </div>
+        <div>
+          <span class="label">Bytes</span>
+          <strong id="bytesMetric">0</strong>
+        </div>
+      </section>
+
+      <section class="layout">
+        <section class="panel config-panel">
+          <div class="panel-title">
+            <h2>Configuration</h2>
+            <button id="saveConfigButton" type="button">Save</button>
+          </div>
+
+          <form id="configForm">
+            <fieldset>
+              <legend>Qualisys</legend>
+              <label>
+                Host
+                <input id="qualisysHost" name="qualisysHost" autocomplete="off" />
+              </label>
+              <label>
+                Port
+                <input id="qualisysPort" name="qualisysPort" type="number" min="1" max="65535" />
+              </label>
+              <label>
+                Timeout ms
+                <input id="qualisysTimeout" name="qualisysTimeout" type="number" min="100" step="100" />
+              </label>
+            </fieldset>
+
+            <fieldset>
+              <legend>Zenoh</legend>
+              <label>
+                Connect
+                <input id="zenohConnect" name="zenohConnect" autocomplete="off" />
+              </label>
+              <label>
+                Frame topic
+                <input id="zenohTopic" name="zenohTopic" autocomplete="off" />
+              </label>
+              <label>
+                Definition topic
+                <input id="definitionTopic" name="definitionTopic" autocomplete="off" />
+              </label>
+              <label>
+                Rigid body prefix
+                <input id="posePrefix" name="posePrefix" autocomplete="off" />
+              </label>
+              <label>
+                Router command
+                <input id="routerCommand" name="routerCommand" autocomplete="off" />
+              </label>
+            </fieldset>
+
+            <fieldset>
+              <legend>Stream</legend>
+              <div class="check-row">
+                <label><input type="checkbox" name="include" value="rigid-bodies" /> Rigid bodies</label>
+                <label><input type="checkbox" name="include" value="labeled-markers" /> Labeled markers</label>
+                <label><input type="checkbox" name="include" value="unlabeled-markers" /> Unlabeled markers</label>
+                <label><input type="checkbox" name="include" value="skeleton" /> Skeleton</label>
+              </div>
+              <label>
+                Transport
+                <select id="transport" name="transport">
+                  <option value="udp">UDP</option>
+                  <option value="tcp">TCP</option>
+                </select>
+              </label>
+              <label>
+                UDP bind
+                <input id="udpBind" name="udpBind" autocomplete="off" />
+              </label>
+            </fieldset>
+          </form>
+        </section>
+
+        <section class="panel">
+          <div class="panel-title">
+            <h2>Published Topics</h2>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Topic</th>
+                  <th>Role</th>
+                  <th>Messages</th>
+                  <th>Bytes</th>
+                </tr>
+              </thead>
+              <tbody id="topicsTable"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section class="layout">
+        <section class="panel">
+          <div class="panel-title">
+            <h2>Rigid Bodies</h2>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>ID</th>
+                  <th>Position m</th>
+                  <th>Residual</th>
+                </tr>
+              </thead>
+              <tbody id="rigidBodiesTable"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-title">
+            <h2>Zenoh Network</h2>
+            <span id="discoveryStatus" class="subtle">Not refreshed</span>
+          </div>
+          <div class="network-grid">
+            <div>
+              <h3>Subscribers</h3>
+              <ul id="subscribersList"></ul>
+            </div>
+            <div>
+              <h3>Publishers</h3>
+              <ul id="publishersList"></ul>
+            </div>
+            <div>
+              <h3>Queryables</h3>
+              <ul id="queryablesList"></ul>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          <h2>Recent Logs</h2>
+          <span id="pathsLine" class="subtle"></span>
+        </div>
+        <ol id="logsList" class="logs"></ol>
+      </section>
+    </main>
+
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
