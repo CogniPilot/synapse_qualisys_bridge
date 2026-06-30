@@ -2357,7 +2357,11 @@ fn install_update_from_status(status: &UpdateStatus) -> Result<String> {
         .asset_name
         .as_deref()
         .unwrap_or("synapse-qualisys-bridge-update.exe");
-    let target = std::env::temp_dir().join(name);
+    let name = Path::new(name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("synapse-qualisys-bridge-update.exe");
+    let target = std::env::temp_dir().join(format!("{BIN_NAME}-{}-{}", now_ms(), name));
 
     let mut response = ureq::get(url)
         .set("User-Agent", BIN_NAME)
@@ -2366,6 +2370,8 @@ fn install_update_from_status(status: &UpdateStatus) -> Result<String> {
         .into_reader();
     let mut file = fs::File::create(&target)?;
     std::io::copy(&mut response, &mut file)?;
+    file.flush()?;
+    drop(file);
 
     if cfg!(windows) {
         Command::new(&target)
@@ -2373,6 +2379,7 @@ fn install_update_from_status(status: &UpdateStatus) -> Result<String> {
                 "/VERYSILENT",
                 "/NORESTART",
                 "/CLOSEAPPLICATIONS",
+                "/FORCECLOSEAPPLICATIONS",
                 "/RESTARTAPPLICATIONS",
             ])
             .spawn()
