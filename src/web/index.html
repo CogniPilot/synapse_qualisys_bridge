@@ -45,7 +45,15 @@
 
       <section class="panel subscribe-panel" aria-label="Network subscription">
         <div class="panel-title">
-          <h2>Network Subscribe</h2>
+          <h2>
+            Network Subscribe
+            <span
+              class="help"
+              tabindex="0"
+              data-tip="Use these values in another Zenoh process to subscribe to data this bridge is already publishing."
+              aria-label="Network subscribe help"
+              >?</span>
+          </h2>
           <span id="networkMode" class="subtle"></span>
         </div>
         <div class="subscribe-grid">
@@ -94,15 +102,27 @@
             <fieldset>
               <legend>Qualisys</legend>
               <label>
-                Host
+                <span class="field-label">
+                  Host
+                  <span class="help" tabindex="0" data-tip="QTM host name or IP address." aria-label="Qualisys host help"
+                    >?</span>
+                </span>
                 <input id="qualisysHost" name="qualisysHost" autocomplete="off" />
               </label>
               <label>
-                Port
+                <span class="field-label">
+                  Port
+                  <span class="help" tabindex="0" data-tip="QTM RT TCP command port." aria-label="Qualisys port help"
+                    >?</span>
+                </span>
                 <input id="qualisysPort" name="qualisysPort" type="number" min="1" max="65535" />
               </label>
               <label>
-                Timeout ms
+                <span class="field-label">
+                  Timeout ms
+                  <span class="help" tabindex="0" data-tip="QTM command and stream receive timeout." aria-label="Timeout help"
+                    >?</span>
+                </span>
                 <input id="qualisysTimeout" name="qualisysTimeout" type="number" min="100" step="100" />
               </label>
             </fieldset>
@@ -110,7 +130,11 @@
             <fieldset>
               <legend>Zenoh</legend>
               <label>
-                Mode
+                <span class="field-label">
+                  Mode
+                  <span class="help" tabindex="0" data-tip="Router serves local subscribers; client connects to an upstream router; peer joins peers directly." aria-label="Zenoh mode help"
+                    >?</span>
+                </span>
                 <select id="zenohMode" name="zenohMode">
                   <option value="router">Router</option>
                   <option value="client">Client</option>
@@ -118,29 +142,57 @@
                 </select>
               </label>
               <label>
-                Listen endpoints
+                <span class="field-label">
+                  Listen endpoints
+                  <span class="help" tabindex="0" data-tip="Local Zenoh endpoints this bridge opens for subscribers." aria-label="Zenoh listen endpoint help"
+                    >?</span>
+                </span>
                 <input id="zenohListen" name="zenohListen" autocomplete="off" />
               </label>
               <label>
-                Connect
+                <span class="field-label">
+                  Connect
+                  <span class="help" tabindex="0" data-tip="Upstream Zenoh router or peer endpoints to connect to." aria-label="Zenoh connect help"
+                    >?</span>
+                </span>
                 <input id="zenohConnect" name="zenohConnect" autocomplete="off" />
               </label>
               <label>
-                Frame topic
+                <span class="field-label">
+                  Frame topic
+                  <span class="help" tabindex="0" data-tip="Zenoh key expression for full synapse.topic.MocapFrame FlatBuffers." aria-label="Frame topic help"
+                    >?</span>
+                </span>
                 <input id="zenohTopic" name="zenohTopic" autocomplete="off" />
               </label>
               <label>
-                Definition topic
+                <span class="field-label">
+                  Definition topic
+                  <span class="help" tabindex="0" data-tip="Zenoh key expression for static mocap names and definitions." aria-label="Definition topic help"
+                    >?</span>
+                </span>
                 <input id="definitionTopic" name="definitionTopic" autocomplete="off" />
               </label>
               <label>
-                Rigid body prefix
+                <span class="field-label">
+                  Rigid body prefix
+                  <span class="help" tabindex="0" data-tip="Prefix for compact per-rigid-body pose topics." aria-label="Rigid body prefix help"
+                    >?</span>
+                </span>
                 <input id="posePrefix" name="posePrefix" autocomplete="off" />
               </label>
             </fieldset>
 
             <fieldset>
-              <legend>Stream</legend>
+              <legend>
+                QTM Stream
+                <span
+                  class="help"
+                  tabindex="0"
+                  data-tip="These checkboxes select QTM components requested continuously from Qualisys; Zenoh subscribers do not request them on demand."
+                  aria-label="QTM stream help"
+                  >?</span>
+              </legend>
               <div class="check-row">
                 <label><input type="checkbox" name="include" value="rigid-bodies" /> Rigid bodies</label>
                 <label><input type="checkbox" name="include" value="labeled-markers" /> Labeled markers</label>
@@ -148,14 +200,22 @@
                 <label><input type="checkbox" name="include" value="skeleton" /> Skeleton</label>
               </div>
               <label>
-                Transport
+                <span class="field-label">
+                  Transport
+                  <span class="help" tabindex="0" data-tip="Transport used for QTM streamframes." aria-label="Transport help"
+                    >?</span>
+                </span>
                 <select id="transport" name="transport">
                   <option value="udp">UDP</option>
                   <option value="tcp">TCP</option>
                 </select>
               </label>
               <label>
-                UDP bind
+                <span class="field-label">
+                  UDP bind
+                  <span class="help" tabindex="0" data-tip="Local UDP address used when QTM streams over UDP." aria-label="UDP bind help"
+                    >?</span>
+                </span>
                 <input id="udpBind" name="udpBind" autocomplete="off" />
               </label>
             </fieldset>
@@ -192,6 +252,7 @@
               <tr>
                 <th>Name</th>
                 <th>ID</th>
+                <th>Valid</th>
                 <th>Position m</th>
                 <th>Residual</th>
               </tr>
@@ -204,7 +265,10 @@
       <section class="panel">
         <div class="panel-title">
           <h2>Recent Logs</h2>
-          <span id="pathsLine" class="subtle"></span>
+          <div class="panel-actions">
+            <span id="pathsLine" class="subtle"></span>
+            <button id="clearLogsButton" type="button">Clear Logs</button>
+          </div>
         </div>
         <ol id="logsList" class="logs"></ol>
       </section>

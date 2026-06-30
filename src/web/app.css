@@ -235,6 +235,15 @@ code {
   margin-bottom: 12px;
 }
 
+.panel-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
 form {
   display: grid;
   gap: 14px;
@@ -264,6 +273,70 @@ label {
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
+}
+
+.field-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.help {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  border: 1px solid #b7c2ce;
+  border-radius: 50%;
+  color: var(--muted);
+  background: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  text-transform: none;
+  cursor: help;
+}
+
+.help::after {
+  position: absolute;
+  top: calc(100% + 7px);
+  left: 0;
+  z-index: 50;
+  width: max-content;
+  max-width: min(280px, calc(100vw - 32px));
+  padding: 8px 10px;
+  border: 1px solid #324153;
+  border-radius: 6px;
+  color: #ffffff;
+  background: #26323f;
+  box-shadow: 0 8px 20px rgba(20, 30, 40, 0.22);
+  content: attr(data-tip);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.35;
+  opacity: 0;
+  pointer-events: none;
+  text-align: left;
+  transform: translateY(-3px);
+  transition: opacity 120ms ease, transform 120ms ease;
+  visibility: hidden;
+  white-space: normal;
+}
+
+.help:hover,
+.help:focus {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.help:hover::after,
+.help:focus::after {
+  opacity: 1;
+  transform: translateY(0);
+  visibility: visible;
 }
 
 input,

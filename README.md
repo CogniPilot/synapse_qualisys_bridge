@@ -72,8 +72,9 @@ Run from a configuration file:
 synapse-qualisys-bridge --config bridge.toml --open
 ```
 
-By default, the bridge requests and publishes rigid-body pose only. Add
-high-rate data explicitly when bandwidth allows:
+By default, the bridge requests rigid-body pose from the QTM RT stream and
+publishes it continuously on Zenoh. Add high-rate QTM components explicitly
+when bandwidth allows:
 
 ```sh
 cargo run --bin synapse-qualisys-bridge -- \
@@ -82,8 +83,16 @@ cargo run --bin synapse-qualisys-bridge -- \
 ```
 
 Supported `--include` values are `rigid-bodies`, `labeled-markers`,
-`unlabeled-markers`, and `skeleton`. Static metadata is published once on
-`synapse/mocap/definition`.
+`unlabeled-markers`, and `skeleton`. These options select which components the
+bridge requests from Qualisys; Zenoh subscribers consume the already-published
+topics and do not request QTM components on demand. Static metadata is published
+once on `synapse/mocap/definition`.
+
+QTM reports mocap positions in millimeters. The bridge converts all Synapse
+`MocapFrame` positions to meters before publishing, including rigid bodies,
+markers, and skeleton segments. Rigid-body samples set `tracking_valid` false
+when QTM reports a dropped or out-of-sync 6D component, or when the pose values
+are not finite.
 
 The bridge also publishes compact per-rigid-body pose topics by default:
 
@@ -93,8 +102,9 @@ synapse/mocap/rigid_body/<rigid_body_name>/pose
 
 Each payload is 28 bytes: seven little-endian `f32` values in this order:
 `position_m.x`, `position_m.y`, `position_m.z`, `quat.x`, `quat.y`, `quat.z`,
-`quat.w`. Rigid body names come from QTM parameters and are sanitized for Zenoh
-key expressions; missing names fall back to `id_<n>`. Use
+`quat.w`. Position values are meters, converted from QTM millimeters. Rigid body
+names come from QTM parameters and are sanitized for Zenoh key expressions;
+missing names fall back to `id_<n>`. Use
 `--rigid-body-pose-topic-prefix` to change the prefix, or
 `--no-rigid-body-pose-topics` to disable these compact topics.
 

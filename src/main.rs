@@ -37,6 +37,7 @@ const GITHUB_REPO: &str = "synapse_qualisys_bridge";
 const INDEX_HTML: &str = include_str!("web/index.html");
 const APP_CSS: &str = include_str!("web/app.css");
 const APP_JS: &str = include_str!("web/app.js");
+const QTM_MILLIMETERS_TO_METERS: f32 = 0.001;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -641,6 +642,18 @@ impl AppHandle {
         }
     }
 
+    fn clear_logs(&self) -> Result<()> {
+        {
+            let mut state = self.0.state.lock().expect("state lock poisoned");
+            state.logs.clear();
+        }
+        if let Some(parent) = self.0.log_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&self.0.log_path, "")?;
+        Ok(())
+    }
+
     fn start_bridge(&self) -> bool {
         let mut worker = self.0.bridge_worker.lock().expect("bridge lock poisoned");
         if worker
@@ -933,6 +946,7 @@ struct RigidBodyStatus {
     position_m: [f32; 3],
     quaternion: [f32; 4],
     residual: f32,
+    tracking_valid: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1594,6 +1608,28 @@ fn sanitize_keyexpr_segment(input: &str) -> String {
         .to_owned()
 }
 
+fn qtm_mm_to_m(value: f32) -> f32 {
+    value * QTM_MILLIMETERS_TO_METERS
+}
+
+fn qtm_position_m(x_mm: f32, y_mm: f32, z_mm: f32) -> Vec3f {
+    Vec3f::new(qtm_mm_to_m(x_mm), qtm_mm_to_m(y_mm), qtm_mm_to_m(z_mm))
+}
+
+fn qtm_rigid_body_tracking_valid(
+    drop_rate: i16,
+    out_of_sync_rate: i16,
+    x_mm: f32,
+    y_mm: f32,
+    z_mm: f32,
+    rotation_matrix: [f32; 9],
+) -> bool {
+    drop_rate == 0
+        && out_of_sync_rate == 0
+        && [x_mm, y_mm, z_mm].into_iter().all(f32::is_finite)
+        && rotation_matrix.into_iter().all(f32::is_finite)
+}
+
 fn encode_compact_pose(body: &MocapRigidBodySample) -> Vec<u8> {
     let position = body.position();
     let attitude = body.attitude();
@@ -1634,6 +1670,7 @@ fn rigid_body_statuses(
                 position_m: [position.x(), position.y(), position.z()],
                 quaternion: [attitude.x(), attitude.y(), attitude.z(), attitude.w()],
                 residual: body.residual(),
+                tracking_valid: body.tracking_valid(),
             }
         })
         .collect())
@@ -1692,7 +1729,7 @@ fn labeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerSample>> {
             .map(|(index, marker)| {
                 MocapMarkerSample::new(
                     (index + 1) as i32,
-                    &Vec3f::new(marker.x, marker.y, marker.z),
+                    &qtm_position_m(marker.x, marker.y, marker.z),
                     marker.residual,
                 )
             })
@@ -1704,7 +1741,7 @@ fn labeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerSample>> {
             .map(|(index, marker)| {
                 MocapMarkerSample::new(
                     (index + 1) as i32,
-                    &Vec3f::new(marker.x, marker.y, marker.z),
+                    &qtm_position_m(marker.x, marker.y, marker.z),
                     0.0,
                 )
             })
@@ -1726,7 +1763,7 @@ fn unlabeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerSample>> {
             .map(|marker| {
                 MocapMarkerSample::new(
                     marker.id,
-                    &Vec3f::new(marker.x, marker.y, marker.z),
+                    &qtm_position_m(marker.x, marker.y, marker.z),
                     marker.residual,
                 )
             })
@@ -1735,7 +1772,11 @@ fn unlabeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerSample>> {
             .markers
             .iter()
             .map(|marker| {
-                MocapMarkerSample::new(marker.id, &Vec3f::new(marker.x, marker.y, marker.z), 0.0)
+                MocapMarkerSample::new(
+                    marker.id,
+                    &qtm_position_m(marker.x, marker.y, marker.z),
+                    0.0,
+                )
             })
             .collect()),
         _ => Err(BridgeError::MissingComponent("unlabeled marker")),
@@ -1757,7 +1798,7 @@ fn skeleton_segments(frame: &AssembledFrame) -> Result<Vec<MocapSegmentSample>> 
                     MocapSegmentSample::new(
                         (skeleton_index + 1) as i32,
                         segment.id,
-                        &Vec3f::new(segment.position.x, segment.position.y, segment.position.z),
+                        &qtm_position_m(segment.position.x, segment.position.y, segment.position.z),
                         &Quaternionf::new(
                             segment.rotation.x,
                             segment.rotation.y,
@@ -1917,12 +1958,20 @@ fn rigid_bodies(frame: &AssembledFrame) -> Result<Vec<MocapRigidBodySample>> {
             .iter()
             .enumerate()
             .map(|(index, body)| {
+                let tracking_valid = qtm_rigid_body_tracking_valid(
+                    component.drop_rate,
+                    component.out_of_sync_rate,
+                    body.position.x,
+                    body.position.y,
+                    body.position.z,
+                    body.rotation_matrix,
+                );
                 MocapRigidBodySample::new(
                     (index + 1) as i32,
-                    &Vec3f::new(body.position.x, body.position.y, body.position.z),
+                    &qtm_position_m(body.position.x, body.position.y, body.position.z),
                     &quat_from_rotation_matrix(body.rotation_matrix),
                     body.residual,
-                    true,
+                    tracking_valid,
                 )
             })
             .collect()),
@@ -1931,12 +1980,20 @@ fn rigid_bodies(frame: &AssembledFrame) -> Result<Vec<MocapRigidBodySample>> {
             .iter()
             .enumerate()
             .map(|(index, body)| {
+                let tracking_valid = qtm_rigid_body_tracking_valid(
+                    component.drop_rate,
+                    component.out_of_sync_rate,
+                    body.position.x,
+                    body.position.y,
+                    body.position.z,
+                    body.rotation_matrix,
+                );
                 MocapRigidBodySample::new(
                     (index + 1) as i32,
-                    &Vec3f::new(body.position.x, body.position.y, body.position.z),
+                    &qtm_position_m(body.position.x, body.position.y, body.position.z),
                     &quat_from_rotation_matrix(body.rotation_matrix),
                     0.0,
-                    true,
+                    tracking_valid,
                 )
             })
             .collect()),
@@ -2043,6 +2100,12 @@ fn handle_request(app: AppHandle, mut request: Request) {
                 message: "Bridge restart requested".to_owned(),
             })
         }
+        (Method::Post, "/api/logs/clear") => match app.clear_logs() {
+            Ok(()) => json_response(&MessageResponse {
+                message: "Logs cleared".to_owned(),
+            }),
+            Err(error) => error_response(StatusCode(500), &error.to_string()),
+        },
         (Method::Get, "/api/zenoh/discovery") => json_response(&app.discover_zenoh()),
         (Method::Post, "/api/diagnostics/qualisys") => {
             json_response(&app.run_qualisys_diagnostic())
@@ -2422,4 +2485,50 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qtm_positions_are_converted_from_millimeters_to_meters() {
+        let position = qtm_position_m(1000.0, -2500.0, 12.5);
+
+        assert_eq!(position.x(), 1.0);
+        assert_eq!(position.y(), -2.5);
+        assert_eq!(position.z(), 0.0125);
+    }
+
+    #[test]
+    fn rigid_body_tracking_valid_rejects_dropped_or_invalid_data() {
+        let rotation = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+        assert!(qtm_rigid_body_tracking_valid(0, 0, 1.0, 2.0, 3.0, rotation));
+        assert!(!qtm_rigid_body_tracking_valid(
+            1, 0, 1.0, 2.0, 3.0, rotation
+        ));
+        assert!(!qtm_rigid_body_tracking_valid(
+            0, 1, 1.0, 2.0, 3.0, rotation
+        ));
+        assert!(!qtm_rigid_body_tracking_valid(
+            0,
+            0,
+            f32::NAN,
+            2.0,
+            3.0,
+            rotation
+        ));
+
+        let mut invalid_rotation = rotation;
+        invalid_rotation[0] = f32::NAN;
+        assert!(!qtm_rigid_body_tracking_valid(
+            0,
+            0,
+            1.0,
+            2.0,
+            3.0,
+            invalid_rotation
+        ));
+    }
 }

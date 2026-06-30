@@ -119,7 +119,7 @@ function renderRigidBodies(bodies) {
   const tbody = $("rigidBodiesTable");
   tbody.replaceChildren();
   if (!bodies.length) {
-    tbody.append(row(["No rigid bodies received", "", "", ""]));
+    tbody.append(row(["No rigid bodies received", "", "", "", ""]));
     return;
   }
   for (const body of bodies) {
@@ -127,6 +127,7 @@ function renderRigidBodies(bodies) {
       row([
         body.name,
         body.id,
+        body.tracking_valid ? "true" : "false",
         body.position_m.map((v) => Number(v).toFixed(3)).join(", "),
         Number(body.residual).toFixed(3),
       ]),
@@ -252,9 +253,16 @@ async function installUpdate() {
   await refreshStatus();
 }
 
+async function clearLogs() {
+  const result = await post("/api/logs/clear");
+  toast(result.message || "Logs cleared");
+  await refreshStatus();
+}
+
 function bindEvents() {
   $("saveConfigButton").addEventListener("click", () => saveConfig().catch((e) => toast(e.message)));
   $("openLogsButton").addEventListener("click", () => refreshStatus());
+  $("clearLogsButton").addEventListener("click", () => clearLogs().catch((e) => toast(e.message)));
   $("checkUpdatesButton").addEventListener("click", () => checkUpdates().catch((e) => toast(e.message)));
   $("installUpdateButton").addEventListener("click", () => installUpdate().catch((e) => toast(e.message)));
 
