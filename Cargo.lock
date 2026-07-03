@@ -2639,16 +2639,16 @@ dependencies = [
 
 [[package]]
 name = "synapse_fbs"
-version = "0.1.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "725bd4cf3eaaabf289c9fc434d144f3587f1e039d60e2f28b18b6f38963a28ad"
+checksum = "295b0672c4d15ef7d90429c18e6d19bf2f34135af3c054688309aaf31c2056ab"
 dependencies = [
  "flatbuffers",
 ]
 
 [[package]]
 name = "synapse_qualisys_bridge"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "clap",
  "flatbuffers",

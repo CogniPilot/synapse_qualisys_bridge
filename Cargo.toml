@@ -1,6 +1,6 @@
 [package]
 name = "synapse_qualisys_bridge"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 description = "Qualisys QTM RT to Synapse FlatBuffers over Zenoh bridge"
 license = "MIT OR Apache-2.0"
@@ -17,7 +17,7 @@ qualisys_rust_sdk = { path = "../qualisys_rust_sdk" }
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-synapse_fbs = "0.1.1"
+synapse_fbs = "0.3.0"
 thiserror = "2.0"
 tiny_http = "0.12"
 toml = "0.8"

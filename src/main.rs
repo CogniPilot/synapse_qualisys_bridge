@@ -19,11 +19,12 @@ use qualisys_rust_sdk::rt::{
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use synapse_fbs::synapse::types::{Quaternionf, Vec3f};
 use synapse_fbs::topic::{
     MocapDefinition, MocapDefinitionArgs, MocapFrame, MocapFrameArgs, MocapMarkerDefinition,
     MocapMarkerDefinitionArgs, MocapMarkerSample, MocapRigidBodyDefinition,
     MocapRigidBodyDefinitionArgs, MocapRigidBodySample, MocapSegmentDefinition,
-    MocapSegmentDefinitionArgs, MocapSegmentSample, Quaternionf, Vec3f,
+    MocapSegmentDefinitionArgs, MocapSegmentSample,
 };
 use thiserror::Error;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -1631,7 +1632,7 @@ fn qtm_rigid_body_tracking_valid(
 }
 
 fn encode_compact_pose(body: &MocapRigidBodySample) -> Vec<u8> {
-    let position = body.position();
+    let position = body.position_enu_m();
     let attitude = body.attitude();
     let values = [
         position.x(),
@@ -1662,7 +1663,7 @@ fn rigid_body_statuses(
                 .filter(|name| !name.is_empty())
                 .cloned()
                 .unwrap_or_else(|| format!("id_{}", body.id()));
-            let position = body.position();
+            let position = body.position_enu_m();
             let attitude = body.attitude();
             RigidBodyStatus {
                 id: body.id(),
