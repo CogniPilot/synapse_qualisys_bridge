@@ -2648,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "synapse_qualisys_bridge"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "clap",
  "flatbuffers",
