@@ -1970,7 +1970,7 @@ fn rigid_bodies(frame: &AssembledFrame) -> Result<Vec<MocapRigidBodySample>> {
                 MocapRigidBodySample::new(
                     (index + 1) as i32,
                     &qtm_position_m(body.position.x, body.position.y, body.position.z),
-                    &quat_from_rotation_matrix(body.rotation_matrix),
+                    &qtm_attitude_from_rotation_matrix(body.rotation_matrix),
                     body.residual,
                     tracking_valid,
                 )
@@ -1992,7 +1992,7 @@ fn rigid_bodies(frame: &AssembledFrame) -> Result<Vec<MocapRigidBodySample>> {
                 MocapRigidBodySample::new(
                     (index + 1) as i32,
                     &qtm_position_m(body.position.x, body.position.y, body.position.z),
-                    &quat_from_rotation_matrix(body.rotation_matrix),
+                    &qtm_attitude_from_rotation_matrix(body.rotation_matrix),
                     0.0,
                     tracking_valid,
                 )
@@ -2039,6 +2039,13 @@ fn quat_from_rotation_matrix(m: [f32; 9]) -> Quaternionf {
     };
 
     qtm_quaternion(x, y, z, w)
+}
+
+fn qtm_attitude_from_rotation_matrix(m: [f32; 9]) -> Quaternionf {
+    // QTM's 6D rotation matrix is world-to-body. Synapse mocap attitude is
+    // body-FLU to ENU, so transpose the orthonormal matrix before converting
+    // it to the published quaternion.
+    quat_from_rotation_matrix([m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]])
 }
 
 fn qtm_quaternion(x: f32, y: f32, z: f32, w: f32) -> Quaternionf {
@@ -2562,6 +2569,22 @@ mod tests {
         assert_eq!(q.x(), 0.0);
         assert_eq!(q.y(), 0.0);
         assert_eq!(q.z(), 0.0);
+    }
+
+    #[test]
+    fn qtm_attitude_transposes_matrix_for_positive_synapse_yaw() {
+        let yaw = 60.0_f32.to_radians();
+        let (sin_yaw, cos_yaw) = yaw.sin_cos();
+        // QTM 6D matrix for a body yawed +60 deg in ENU, represented as
+        // world-to-body. Publishing it directly would produce -60 deg yaw.
+        let q = qtm_attitude_from_rotation_matrix([
+            cos_yaw, sin_yaw, 0.0, -sin_yaw, cos_yaw, 0.0, 0.0, 0.0, 1.0,
+        ]);
+
+        assert!((q.w() - (yaw / 2.0).cos()).abs() < 1.0e-6);
+        assert_eq!(q.x(), 0.0);
+        assert_eq!(q.y(), 0.0);
+        assert!((q.z() - (yaw / 2.0).sin()).abs() < 1.0e-6);
     }
 
     #[test]
