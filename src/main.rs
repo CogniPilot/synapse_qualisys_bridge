@@ -1800,7 +1800,7 @@ fn skeleton_segments(frame: &AssembledFrame) -> Result<Vec<MocapSegmentSample>> 
                         (skeleton_index + 1) as i32,
                         segment.id,
                         &qtm_position_m(segment.position.x, segment.position.y, segment.position.z),
-                        &Quaternionf::new(
+                        &qtm_quaternion(
                             segment.rotation.x,
                             segment.rotation.y,
                             segment.rotation.z,
@@ -2038,7 +2038,11 @@ fn quat_from_rotation_matrix(m: [f32; 9]) -> Quaternionf {
         )
     };
 
-    Quaternionf::new(x, y, z, w)
+    qtm_quaternion(x, y, z, w)
+}
+
+fn qtm_quaternion(x: f32, y: f32, z: f32, w: f32) -> Quaternionf {
+    Quaternionf::new(w, x, y, z)
 }
 
 fn run_web_server(app: AppHandle, bind: SocketAddr) -> Result<()> {
@@ -2538,5 +2542,53 @@ mod tests {
             3.0,
             invalid_rotation
         ));
+    }
+
+    #[test]
+    fn qtm_quaternions_are_stored_in_synapse_field_order() {
+        let q = qtm_quaternion(0.1, -0.2, 0.3, 0.9);
+
+        assert_eq!(q.w(), 0.9);
+        assert_eq!(q.x(), 0.1);
+        assert_eq!(q.y(), -0.2);
+        assert_eq!(q.z(), 0.3);
+    }
+
+    #[test]
+    fn identity_rotation_matrix_encodes_identity_quaternion() {
+        let q = quat_from_rotation_matrix([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+
+        assert_eq!(q.w(), 1.0);
+        assert_eq!(q.x(), 0.0);
+        assert_eq!(q.y(), 0.0);
+        assert_eq!(q.z(), 0.0);
+    }
+
+    #[test]
+    fn compact_pose_preserves_xyzw_wire_order() {
+        let body = MocapRigidBodySample::new(
+            1,
+            &Vec3f::new(1.0, 2.0, 3.0),
+            &qtm_quaternion(0.1, -0.2, 0.3, 0.9),
+            0.0,
+            true,
+        );
+
+        let payload = encode_compact_pose(&body);
+        let value = |index: usize| {
+            f32::from_le_bytes(
+                payload[index * size_of::<f32>()..(index + 1) * size_of::<f32>()]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+
+        assert_eq!(value(0), 1.0);
+        assert_eq!(value(1), 2.0);
+        assert_eq!(value(2), 3.0);
+        assert_eq!(value(3), 0.1);
+        assert_eq!(value(4), -0.2);
+        assert_eq!(value(5), 0.3);
+        assert_eq!(value(6), 0.9);
     }
 }
