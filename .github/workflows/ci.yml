@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  BRIDGE_DIR: synapse_qualisys_bridge
+  QUALISYS_SDK_DIR: qualisys_rust_sdk
+
+jobs:
+  test:
+    name: Nix CI
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout bridge
+        uses: actions/checkout@v7
+        with:
+          path: ${{ env.BRIDGE_DIR }}
+
+      - name: Checkout Qualisys Rust SDK
+        uses: actions/checkout@v7
+        with:
+          repository: CogniPilot/qualisys_rust_sdk
+          path: ${{ env.QUALISYS_SDK_DIR }}
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: Run CI
+        working-directory: ${{ env.BRIDGE_DIR }}
+        env:
+          QUALISYS_SDK_DIR: ../${{ env.QUALISYS_SDK_DIR }}
+        run: nix run .#ci

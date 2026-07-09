@@ -189,10 +189,12 @@ async function loadConfig() {
   $("zenohListen").value = cfg.zenoh.listen;
   $("zenohConnect").value = cfg.zenoh.connect;
   $("zenohTopic").value = cfg.zenoh.topic;
-  $("definitionTopic").value = cfg.zenoh.definition_topic;
-  $("posePrefix").value = cfg.zenoh.rigid_body_pose_topic_prefix;
+  $("externalOdometryPrefix").value = cfg.zenoh.external_odometry_topic_prefix;
+  $("publishExternalOdometry").checked = !cfg.zenoh.no_external_odometry;
   $("transport").value = cfg.stream.transport;
   $("udpBind").value = cfg.stream.udp_bind;
+  $("velocityMaxGap").value = cfg.stream.velocity_max_gap_ms;
+  $("velocityMinDt").value = cfg.stream.velocity_min_dt_ms;
 
   for (const checkbox of document.querySelectorAll("input[name='include']")) {
     checkbox.checked = cfg.stream.include.includes(checkbox.value);
@@ -208,10 +210,12 @@ function readConfigForm() {
   cfg.zenoh.listen = $("zenohListen").value.trim();
   cfg.zenoh.connect = $("zenohConnect").value.trim();
   cfg.zenoh.topic = $("zenohTopic").value.trim();
-  cfg.zenoh.definition_topic = $("definitionTopic").value.trim();
-  cfg.zenoh.rigid_body_pose_topic_prefix = $("posePrefix").value.trim();
+  cfg.zenoh.external_odometry_topic_prefix = $("externalOdometryPrefix").value.trim();
+  cfg.zenoh.no_external_odometry = !$("publishExternalOdometry").checked;
   cfg.stream.transport = $("transport").value;
   cfg.stream.udp_bind = $("udpBind").value.trim();
+  cfg.stream.velocity_max_gap_ms = Number($("velocityMaxGap").value);
+  cfg.stream.velocity_min_dt_ms = Number($("velocityMinDt").value);
   cfg.stream.include = Array.from(document.querySelectorAll("input[name='include']:checked")).map(
     (checkbox) => checkbox.value,
   );
