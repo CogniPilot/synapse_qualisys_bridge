@@ -35,13 +35,13 @@ jobs:
 
     steps:
       - name: Checkout bridge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: ${{ env.BRIDGE_DIR }}
           ref: ${{ github.ref }}
 
       - name: Checkout Qualisys Rust SDK
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: CogniPilot/qualisys_rust_sdk
           path: qualisys_rust_sdk
@@ -232,7 +232,7 @@ jobs:
 
     steps:
       - name: Checkout bridge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: ${{ env.BRIDGE_DIR }}
           ref: ${{ github.ref_name }}
