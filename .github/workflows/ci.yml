@@ -20,12 +20,12 @@ jobs:
 
     steps:
       - name: Checkout bridge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: ${{ env.BRIDGE_DIR }}
 
       - name: Checkout Qualisys Rust SDK
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: CogniPilot/qualisys_rust_sdk
           path: ${{ env.QUALISYS_SDK_DIR }}
