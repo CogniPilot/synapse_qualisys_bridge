@@ -47,14 +47,14 @@ Useful defaults can also come from environment variables:
 QUALISYS_HOST=127.0.0.1 cargo run --bin synapse-qualisys-bridge
 ```
 
-The default Zenoh key expression is `synapse/mocap/frame`. Run
+The default Zenoh key expression is `synapse/v1/topic/mocap_frame`. Run
 `cargo run --bin synapse-qualisys-bridge -- --help` for all options.
 
 Example subscriber configuration from another machine:
 
 ```text
 endpoint: udp/<bridge-pc-ip>:7447
-key expression: synapse/mocap/**
+key expression: synapse/v1/topic/**
 ```
 
 `zenoh.listen` and `zenoh.connect` can each contain multiple endpoints separated
@@ -82,31 +82,52 @@ cargo run --bin synapse-qualisys-bridge -- \
   --include rigid-bodies,labeled-markers
 ```
 
-Supported `--include` values are `rigid-bodies`, `labeled-markers`,
-`unlabeled-markers`, and `skeleton`. These options select which components the
-bridge requests from Qualisys; Zenoh subscribers consume the already-published
-topics and do not request QTM components on demand. Static metadata is published
-once on `synapse/mocap/definition`.
+Supported `--include` values are `rigid-bodies`, `labeled-markers`, and
+`unlabeled-markers`. These options select which components the bridge requests
+from Qualisys; Zenoh subscribers consume the already-published topics and do not
+request QTM components on demand.
 
 QTM reports mocap positions in millimeters. The bridge converts all Synapse
-`MocapFrame` positions to meters before publishing, including rigid bodies,
-markers, and skeleton segments. Rigid-body samples set `tracking_valid` false
-when QTM reports a dropped or out-of-sync 6D component, or when the pose values
-are not finite.
+positions to meters before publishing. The raw `synapse.topic.MocapFrame`
+FlatBuffer preserves source-like marker and 6D rigid-body samples for logging
+and tooling. Rigid-body samples are marked invalid when QTM reports a dropped or
+out-of-sync 6D component, or when the pose values are not finite.
 
-The bridge also publishes compact per-rigid-body pose topics by default:
+The bridge also publishes fixed-layout per-rigid-body external odometry payloads
+by default:
 
 ```text
-synapse/mocap/rigid_body/<rigid_body_name>/pose
+synapse/v1/topic/external_odometry/<rigid_body_id>
 ```
 
-Each payload is 28 bytes: seven little-endian `f32` values in this order:
-`position_m.x`, `position_m.y`, `position_m.z`, `quat.x`, `quat.y`, `quat.z`,
-`quat.w`. Position values are meters, converted from QTM millimeters. Rigid body
-names come from QTM parameters and are sanitized for Zenoh key expressions;
-missing names fall back to `id_<n>`. Use
-`--rigid-body-pose-topic-prefix` to change the prefix, or
-`--no-rigid-body-pose-topics` to disable these compact topics.
+Each payload is the 136-byte `synapse.topic.ExternalOdometryData` struct:
+timestamp, position in ENU meters, attitude as body-FLU to ENU quaternion,
+linear velocity in ENU meters per second, and angular velocity in body-FLU
+radians per second. The derived odometry path is demand-driven: the bridge only
+runs the per-body estimator and publishes these payloads when Zenoh reports a
+matching subscriber for that body's odometry key expression. Subscribing only
+to raw mocap frames does not force odometry work. The estimator is a 12D
+Lie/error-state EKF prediction model generated from the
+`Estimation.Examples.MocapExternalOdometryIEKF` Modelica example in the pinned
+`third_party/modelica_models` submodule. It estimates position, attitude,
+linear velocity, and angular velocity without a centered least-squares fit that
+would add lookahead latency. State resets across dropped, out-of-sync, invalid,
+or too-sparse samples. Use `--external-odometry-topic-prefix` to change the
+prefix, or `--no-external-odometry` to disable these topics.
+
+Regenerate the estimator kernel after updating Rumoca or `modelica_models`:
+
+```sh
+git submodule update --init third_party/modelica_models
+rumoca compile \
+  third_party/modelica_models/Estimation/Examples/MocapExternalOdometryIEKF.mo \
+  --model Estimation.Examples.MocapExternalOdometryIEKF \
+  --source-root third_party/modelica_models \
+  --target rust-fixed-solve \
+  --output /tmp/synapse_qualisys_bridge_codegen
+cp /tmp/synapse_qualisys_bridge_codegen/Estimation_Examples_MocapExternalOdometryIEKF_fixed_solve.rs \
+  src/estimator/generated/MocapExternalOdometryEstimator_solve.rs
+```
 
 ## Release binaries and schema compatibility
 

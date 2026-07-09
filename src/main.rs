@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::mem::size_of;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,24 +9,28 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod estimator;
+
 use clap::{ArgAction, Parser, ValueEnum};
+use estimator::{
+    ExternalOdometryEstimators, MocapExternalOdometryEstimatorConfig, MocapMeasurement,
+};
 use flatbuffers::FlatBufferBuilder;
 use qualisys_rust_sdk::rt::{
     AssembledFrame, Client, ClientOptions, ComponentData, ComponentSelection, ComponentType,
-    FrameAccumulator, MocapParameters, MocapSkeletonSegment, StreamFramesRequest, StreamPacket,
-    StreamRate, StreamTransport,
+    FrameAccumulator, MocapParameters, StreamFramesRequest, StreamPacket, StreamRate,
+    StreamTransport,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use synapse_fbs::synapse::types::{Quaternionf, Vec3f};
+use synapse_fbs::synapse::types::{Quaternionf, RateTriplet, RotationMatrix3f, Vec3f};
 use synapse_fbs::topic::{
-    MocapDefinition, MocapDefinitionArgs, MocapFrame, MocapFrameArgs, MocapMarkerDefinition,
-    MocapMarkerDefinitionArgs, MocapMarkerSample, MocapRigidBodyDefinition,
-    MocapRigidBodyDefinitionArgs, MocapRigidBodySample, MocapSegmentDefinition,
-    MocapSegmentDefinitionArgs, MocapSegmentSample,
+    ExternalOdometryData, MocapFrame, MocapFrameArgs, MocapMarkerData, MocapRawComponent,
+    MocapRawFlags, MocapRigidBodyData,
 };
 use thiserror::Error;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+use zenoh::pubsub::Publisher;
 use zenoh::query::{ConsolidationMode, QueryTarget};
 use zenoh::{Wait, config::Config};
 
@@ -58,8 +61,7 @@ Environment:
   SYNAPSE_QUALISYS_BRIDGE_CONFIG
   QUALISYS_HOST, QUALISYS_PORT, QUALISYS_TIMEOUT_MS
   ZENOH_MODE, ZENOH_CONNECT, ZENOH_LISTEN
-  ZENOH_TOPIC, ZENOH_DEFINITION_TOPIC
-  ZENOH_RIGID_BODY_POSE_TOPIC_PREFIX, ZENOH_NO_RIGID_BODY_POSE_TOPICS
+  ZENOH_TOPIC, ZENOH_EXTERNAL_ODOMETRY_TOPIC_PREFIX, ZENOH_NO_EXTERNAL_ODOMETRY
   MOCAP_INCLUDE"
 )]
 struct Cli {
@@ -148,6 +150,22 @@ struct StreamArgs {
         help = "Optional QTM UDP destination IP; defaults to QTM's peer address"
     )]
     udp_destination: Option<IpAddr>,
+
+    #[arg(
+        long = "velocity-max-gap-ms",
+        env = "VELOCITY_MAX_GAP_MS",
+        value_name = "MS",
+        help = "Maximum valid-sample gap before ExternalOdometry twist is reset"
+    )]
+    velocity_max_gap_ms: Option<u64>,
+
+    #[arg(
+        long = "velocity-min-dt-ms",
+        env = "VELOCITY_MIN_DT_MS",
+        value_name = "MS",
+        help = "Minimum sample spacing used for velocity differentiation"
+    )]
+    velocity_min_dt_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
@@ -163,7 +181,6 @@ enum MocapData {
     RigidBodies,
     LabeledMarkers,
     UnlabeledMarkers,
-    Skeleton,
 }
 
 #[derive(Debug, Parser)]
@@ -204,29 +221,22 @@ struct ZenohArgs {
     topic: Option<String>,
 
     #[arg(
-        long = "definition-topic",
-        alias = "zenoh-definition-topic",
-        env = "ZENOH_DEFINITION_TOPIC",
+        long = "external-odometry-topic-prefix",
+        alias = "rigid-body-pose-topic-prefix",
+        env = "ZENOH_EXTERNAL_ODOMETRY_TOPIC_PREFIX",
         value_name = "KEYEXPR",
-        help = "Zenoh key expression for low-rate synapse.topic.MocapDefinition metadata"
+        help = "Zenoh key expression prefix for bare ExternalOdometry payloads"
     )]
-    definition_topic: Option<String>,
+    external_odometry_topic_prefix: Option<String>,
 
     #[arg(
-        long = "rigid-body-pose-topic-prefix",
-        env = "ZENOH_RIGID_BODY_POSE_TOPIC_PREFIX",
-        value_name = "KEYEXPR",
-        help = "Zenoh key expression prefix for compact per-rigid-body pose topics"
-    )]
-    rigid_body_pose_topic_prefix: Option<String>,
-
-    #[arg(
-        long = "no-rigid-body-pose-topics",
-        env = "ZENOH_NO_RIGID_BODY_POSE_TOPICS",
+        long = "no-external-odometry",
+        alias = "no-rigid-body-pose-topics",
+        env = "ZENOH_NO_EXTERNAL_ODOMETRY",
         action = ArgAction::SetTrue,
-        help = "Disable compact per-rigid-body pose topic publishing"
+        help = "Disable per-rigid-body ExternalOdometry publishing"
     )]
-    no_rigid_body_pose_topics: bool,
+    no_external_odometry: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -328,6 +338,12 @@ struct StreamConfig {
     transport: StreamTransportArg,
     udp_bind: SocketAddr,
     udp_destination: Option<IpAddr>,
+    velocity_max_gap_ms: u64,
+    velocity_min_dt_ms: u64,
+    position_stddev_m: f32,
+    attitude_stddev_rad: f32,
+    linear_velocity_stddev_m_s: f32,
+    angular_velocity_stddev_rad_s: f32,
 }
 
 impl Default for StreamConfig {
@@ -337,6 +353,12 @@ impl Default for StreamConfig {
             transport: StreamTransportArg::Udp,
             udp_bind: "0.0.0.0:0".parse().expect("valid default UDP bind"),
             udp_destination: None,
+            velocity_max_gap_ms: 100,
+            velocity_min_dt_ms: 1,
+            position_stddev_m: 0.002,
+            attitude_stddev_rad: 0.01,
+            linear_velocity_stddev_m_s: 0.05,
+            angular_velocity_stddev_rad_s: 0.10,
         }
     }
 }
@@ -348,9 +370,8 @@ struct ZenohConfig {
     connect: String,
     listen: String,
     topic: String,
-    definition_topic: String,
-    rigid_body_pose_topic_prefix: String,
-    no_rigid_body_pose_topics: bool,
+    external_odometry_topic_prefix: String,
+    no_external_odometry: bool,
     admin_query_timeout_ms: u64,
 }
 
@@ -360,10 +381,9 @@ impl Default for ZenohConfig {
             mode: ZenohMode::Router,
             connect: String::new(),
             listen: "udp/0.0.0.0:7447,tcp/0.0.0.0:7447".to_owned(),
-            topic: "synapse/mocap/frame".to_owned(),
-            definition_topic: "synapse/mocap/definition".to_owned(),
-            rigid_body_pose_topic_prefix: "synapse/mocap/rigid_body".to_owned(),
-            no_rigid_body_pose_topics: false,
+            topic: "synapse/v1/topic/mocap_frame".to_owned(),
+            external_odometry_topic_prefix: "synapse/v1/topic/external_odometry".to_owned(),
+            no_external_odometry: false,
             admin_query_timeout_ms: 1_000,
         }
     }
@@ -902,8 +922,7 @@ struct ZenohAccess {
     subscriber_endpoint: Option<String>,
     subscriber_endpoints: Vec<String>,
     frame_topic: String,
-    definition_topic: String,
-    rigid_body_topic_prefix: String,
+    external_odometry_topic_prefix: String,
     sample_key_expr: String,
     example_subscriber_args: Option<String>,
 }
@@ -1144,6 +1163,12 @@ fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
     if cli.stream.udp_destination.is_some() {
         config.stream.udp_destination = cli.stream.udp_destination;
     }
+    if let Some(value) = cli.stream.velocity_max_gap_ms {
+        config.stream.velocity_max_gap_ms = value;
+    }
+    if let Some(value) = cli.stream.velocity_min_dt_ms {
+        config.stream.velocity_min_dt_ms = value;
+    }
     if let Some(mode) = cli.zenoh.zenoh_mode {
         config.zenoh.mode = mode;
     }
@@ -1156,14 +1181,11 @@ fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
     if let Some(topic) = cli.zenoh.topic.as_ref() {
         config.zenoh.topic = topic.clone();
     }
-    if let Some(topic) = cli.zenoh.definition_topic.as_ref() {
-        config.zenoh.definition_topic = topic.clone();
+    if let Some(prefix) = cli.zenoh.external_odometry_topic_prefix.as_ref() {
+        config.zenoh.external_odometry_topic_prefix = prefix.clone();
     }
-    if let Some(prefix) = cli.zenoh.rigid_body_pose_topic_prefix.as_ref() {
-        config.zenoh.rigid_body_pose_topic_prefix = prefix.clone();
-    }
-    if cli.zenoh.no_rigid_body_pose_topics {
-        config.zenoh.no_rigid_body_pose_topics = true;
+    if cli.zenoh.no_external_odometry {
+        config.zenoh.no_external_odometry = true;
     }
     if let Some(bind) = cli.web.web_bind {
         config.web.bind = bind;
@@ -1235,10 +1257,6 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
         .declare_publisher(config.zenoh.topic.clone())
         .wait()
         .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
-    let definition_publisher = session
-        .declare_publisher(config.zenoh.definition_topic.clone())
-        .wait()
-        .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
 
     app.set_qualisys_status(
         "connecting",
@@ -1261,17 +1279,6 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
     let selection = selected_data(config);
     let parameters = client.get_mocap_parameters()?;
     let rigid_body_names = rigid_body_names(&parameters);
-    let definition = encode_mocap_definition(&parameters, &selection)?;
-    let definition_len = definition.len();
-    definition_publisher
-        .put(definition)
-        .wait()
-        .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
-    app.record_topic(
-        config.zenoh.definition_topic.clone(),
-        "mocap definition publisher",
-        definition_len,
-    );
 
     let components = stream_components(&selection);
     let request = StreamFramesRequest::new(
@@ -1293,11 +1300,19 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
     );
 
     let mut accumulator = FrameAccumulator::for_components(components);
+    let mut odometry_estimators = ExternalOdometryEstimators::new(estimator_config(&config.stream));
+    let mut odometry_publishers = ExternalOdometryPublishers::default();
     while !stop.load(Ordering::SeqCst) {
         match client.recv_stream_packet()? {
             StreamPacket::Data(packet) => {
                 for frame in accumulator.push(packet) {
-                    let payload = encode_mocap_frame(&frame, &selection)?;
+                    let rigid_body_frame = if selection.contains(&MocapData::RigidBodies) {
+                        Some(rigid_body_frame(&frame)?)
+                    } else {
+                        None
+                    };
+                    let payload =
+                        encode_mocap_frame(&frame, &selection, rigid_body_frame.as_ref())?;
                     let payload_len = payload.len();
                     publisher
                         .put(payload)
@@ -1309,22 +1324,21 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
                         payload_len,
                     );
 
-                    let compact_topics = publish_rigid_body_pose_topics(
+                    let odometry_topics = publish_external_odometry(
                         &session,
                         config,
-                        &frame,
-                        &selection,
-                        &rigid_body_names,
+                        rigid_body_frame.as_ref(),
+                        &mut odometry_estimators,
+                        &mut odometry_publishers,
                     )?;
-                    for (topic, payload_len) in compact_topics {
-                        app.record_topic(topic, "compact rigid body pose publisher", payload_len);
+                    for (topic, payload_len) in odometry_topics {
+                        app.record_topic(topic, "external odometry publisher", payload_len);
                     }
 
-                    let body_statuses = if selection.contains(&MocapData::RigidBodies) {
-                        rigid_body_statuses(&frame, &rigid_body_names)?
-                    } else {
-                        Vec::new()
-                    };
+                    let body_statuses = rigid_body_frame
+                        .as_ref()
+                        .map(|body_frame| rigid_body_statuses(body_frame, &rigid_body_names))
+                        .unwrap_or_default();
                     app.record_frame(frame.frame_number, frame.timestamp, body_statuses);
                 }
             }
@@ -1397,8 +1411,7 @@ fn zenoh_access(config: &AppConfig) -> ZenohAccess {
         subscriber_endpoint,
         subscriber_endpoints,
         frame_topic: config.zenoh.topic.clone(),
-        definition_topic: config.zenoh.definition_topic.clone(),
-        rigid_body_topic_prefix: config.zenoh.rigid_body_pose_topic_prefix.clone(),
+        external_odometry_topic_prefix: config.zenoh.external_odometry_topic_prefix.clone(),
         sample_key_expr,
         example_subscriber_args,
     }
@@ -1431,8 +1444,7 @@ fn local_network_ip() -> Option<IpAddr> {
 fn subscription_key_expr(config: &AppConfig) -> String {
     let topics = [
         config.zenoh.topic.as_str(),
-        config.zenoh.definition_topic.as_str(),
-        config.zenoh.rigid_body_pose_topic_prefix.as_str(),
+        config.zenoh.external_odometry_topic_prefix.as_str(),
     ];
     let parts: Vec<Vec<&str>> = topics
         .iter()
@@ -1529,9 +1541,6 @@ fn stream_components(selection: &BTreeSet<MocapData>) -> Vec<ComponentSelection>
     if selection.contains(&MocapData::UnlabeledMarkers) {
         components.push(ComponentSelection::ThreeDNoLabelsResidual);
     }
-    if selection.contains(&MocapData::Skeleton) {
-        components.push(ComponentSelection::Skeleton { global: true });
-    }
     components
 }
 
@@ -1549,64 +1558,201 @@ fn rigid_body_names(parameters: &MocapParameters) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn publish_rigid_body_pose_topics(
-    session: &zenoh::Session,
-    config: &AppConfig,
-    frame: &AssembledFrame,
-    selection: &BTreeSet<MocapData>,
-    rigid_body_names: &[String],
-) -> Result<Vec<(String, usize)>> {
-    if config.zenoh.no_rigid_body_pose_topics || !selection.contains(&MocapData::RigidBodies) {
-        return Ok(Vec::new());
+#[derive(Debug, Clone)]
+struct RigidBodyFrame {
+    timestamp_us: u64,
+    frame_number: u32,
+    drop_rate_2d_dpermille: u16,
+    out_of_sync_rate_2d_dpermille: u16,
+    bodies: Vec<RigidBodyObservation>,
+}
+
+#[derive(Debug, Clone)]
+struct RigidBodyObservation {
+    id: i32,
+    position_enu_m: Vec3f,
+    attitude: Quaternionf,
+    rotation: RotationMatrix3f,
+    residual_mm: f32,
+    tracking_valid: bool,
+}
+
+fn estimator_config(config: &StreamConfig) -> MocapExternalOdometryEstimatorConfig {
+    MocapExternalOdometryEstimatorConfig {
+        max_gap_us: config.velocity_max_gap_ms.saturating_mul(1_000),
+        min_dt_us: config.velocity_min_dt_ms.saturating_mul(1_000),
+        position_stddev_m: config.position_stddev_m as f64,
+        attitude_stddev_rad: config.attitude_stddev_rad as f64,
+        linear_velocity_stddev_m_s: config.linear_velocity_stddev_m_s as f64,
+        angular_velocity_stddev_rad_s: config.angular_velocity_stddev_rad_s as f64,
+        ..MocapExternalOdometryEstimatorConfig::default()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExternalOdometryPublishers {
+    publishers: BTreeMap<i32, Publisher<'static>>,
+}
+
+impl ExternalOdometryPublishers {
+    fn publisher(
+        &mut self,
+        session: &zenoh::Session,
+        config: &AppConfig,
+        body_id: i32,
+    ) -> Result<&Publisher<'static>> {
+        if !self.publishers.contains_key(&body_id) {
+            let topic =
+                external_odometry_topic(&config.zenoh.external_odometry_topic_prefix, body_id);
+            let publisher = session
+                .declare_publisher(topic)
+                .wait()
+                .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
+            self.publishers.insert(body_id, publisher);
+        }
+
+        Ok(self
+            .publishers
+            .get(&body_id)
+            .expect("publisher inserted before lookup"))
     }
 
-    let mut published = Vec::new();
-    for body in rigid_bodies(frame)? {
-        let topic = rigid_body_pose_topic(
-            &config.zenoh.rigid_body_pose_topic_prefix,
-            &body,
-            rigid_body_names,
-        );
-        let payload = encode_compact_pose(&body);
+    fn has_matching_subscriber(
+        &mut self,
+        session: &zenoh::Session,
+        config: &AppConfig,
+        body_id: i32,
+    ) -> Result<bool> {
+        Ok(self
+            .publisher(session, config, body_id)?
+            .matching_status()
+            .wait()
+            .map_err(|error| BridgeError::Zenoh(error.to_string()))?
+            .matching())
+    }
+
+    fn publish(
+        &mut self,
+        session: &zenoh::Session,
+        config: &AppConfig,
+        body_id: i32,
+        payload: Vec<u8>,
+    ) -> Result<(String, usize)> {
         let payload_len = payload.len();
-        session
-            .put(topic.clone(), payload)
+        let publisher = self.publisher(session, config, body_id)?;
+        let topic = publisher.key_expr().to_string();
+        publisher
+            .put(payload)
             .wait()
             .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
-        published.push((topic, payload_len));
+        Ok((topic, payload_len))
+    }
+}
+
+fn publish_external_odometry(
+    session: &zenoh::Session,
+    config: &AppConfig,
+    frame: Option<&RigidBodyFrame>,
+    estimators: &mut ExternalOdometryEstimators,
+    publishers: &mut ExternalOdometryPublishers,
+) -> Result<Vec<(String, usize)>> {
+    if config.zenoh.no_external_odometry {
+        return Ok(Vec::new());
+    }
+    let Some(frame) = frame else {
+        return Ok(Vec::new());
+    };
+
+    let mut published = Vec::new();
+    for body in &frame.bodies {
+        if !publishers.has_matching_subscriber(session, config, body.id)? {
+            estimators.clear_body(body.id);
+            continue;
+        }
+
+        let payload =
+            encode_external_odometry(body, frame.timestamp_us, frame.frame_number, estimators);
+        published.push(publishers.publish(session, config, body.id, payload)?);
     }
 
     Ok(published)
 }
 
-fn rigid_body_pose_topic(
-    prefix: &str,
-    body: &MocapRigidBodySample,
-    rigid_body_names: &[String],
-) -> String {
-    let name = usize::try_from(body.id().saturating_sub(1))
-        .ok()
-        .and_then(|index| rigid_body_names.get(index))
-        .filter(|name| !name.is_empty())
-        .map(|name| sanitize_keyexpr_segment(name))
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| format!("id_{}", body.id()));
-    format!("{}/{name}/pose", prefix.trim_end_matches('/'))
+fn external_odometry_topic(prefix: &str, body_id: i32) -> String {
+    format!("{}/{}", prefix.trim_end_matches('/'), body_id.max(0))
 }
 
-fn sanitize_keyexpr_segment(input: &str) -> String {
-    input
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('_')
-        .to_owned()
+fn encode_external_odometry(
+    body: &RigidBodyObservation,
+    timestamp_us: u64,
+    sequence: u32,
+    estimators: &mut ExternalOdometryEstimators,
+) -> Vec<u8> {
+    let measurement = MocapMeasurement {
+        timestamp_us,
+        sequence,
+        position_enu_m: f64_vec3(&body.position_enu_m),
+        attitude_wxyz: f64_quat(&body.attitude),
+        tracking_valid: body.tracking_valid,
+        tracking_quality_pct: if body.tracking_valid { 100 } else { 0 },
+    };
+    let estimate = estimators.update(body.id, measurement);
+
+    let data = ExternalOdometryData::new(
+        estimate.timestamp_us,
+        estimate.last_mocap_timestamp_us,
+        estimate.latency_us,
+        estimate.extrapolation_us,
+        estimate.sequence,
+        &Vec3f::new(
+            estimate.position_enu_m[0],
+            estimate.position_enu_m[1],
+            estimate.position_enu_m[2],
+        ),
+        &Quaternionf::new(
+            estimate.attitude_wxyz[0],
+            estimate.attitude_wxyz[1],
+            estimate.attitude_wxyz[2],
+            estimate.attitude_wxyz[3],
+        ),
+        &Vec3f::new(
+            estimate.linear_velocity_enu_m_s[0],
+            estimate.linear_velocity_enu_m_s[1],
+            estimate.linear_velocity_enu_m_s[2],
+        ),
+        &RateTriplet::new(
+            estimate.angular_velocity_flu_rad_s[0],
+            estimate.angular_velocity_flu_rad_s[1],
+            estimate.angular_velocity_flu_rad_s[2],
+        ),
+        &Vec3f::new(
+            estimate.position_stddev_m[0],
+            estimate.position_stddev_m[1],
+            estimate.position_stddev_m[2],
+        ),
+        &Vec3f::new(
+            estimate.attitude_stddev_rad[0],
+            estimate.attitude_stddev_rad[1],
+            estimate.attitude_stddev_rad[2],
+        ),
+        &Vec3f::new(
+            estimate.linear_velocity_stddev_m_s[0],
+            estimate.linear_velocity_stddev_m_s[1],
+            estimate.linear_velocity_stddev_m_s[2],
+        ),
+        &RateTriplet::new(
+            estimate.angular_velocity_stddev_rad_s[0],
+            estimate.angular_velocity_stddev_rad_s[1],
+            estimate.angular_velocity_stddev_rad_s[2],
+        ),
+        estimate.tracking_quality_pct,
+        estimate.status,
+        u16::from(estimate.frames_since_last_mocap_count),
+        estimate.flags.bits(),
+        1,
+        body.id.clamp(0, u8::MAX as i32) as u8,
+    );
+    data.0.to_vec()
 }
 
 fn qtm_mm_to_m(value: f32) -> f32 {
@@ -1615,6 +1761,35 @@ fn qtm_mm_to_m(value: f32) -> f32 {
 
 fn qtm_position_m(x_mm: f32, y_mm: f32, z_mm: f32) -> Vec3f {
     Vec3f::new(qtm_mm_to_m(x_mm), qtm_mm_to_m(y_mm), qtm_mm_to_m(z_mm))
+}
+
+fn vec3_to_array(value: &Vec3f) -> [f32; 3] {
+    [value.x(), value.y(), value.z()]
+}
+
+fn f64_vec3(value: &Vec3f) -> [f64; 3] {
+    [value.x() as f64, value.y() as f64, value.z() as f64]
+}
+
+fn f64_quat(value: &Quaternionf) -> [f64; 4] {
+    [
+        value.w() as f64,
+        value.x() as f64,
+        value.y() as f64,
+        value.z() as f64,
+    ]
+}
+
+fn quat_xyzw_array(value: &Quaternionf) -> [f32; 4] {
+    [value.x(), value.y(), value.z(), value.w()]
+}
+
+fn qtm_rate_to_dpermille(value: i16) -> u16 {
+    value.max(0) as u16
+}
+
+fn qtm_rotation_matrix_to_synapse(m: [f32; 9]) -> RotationMatrix3f {
+    RotationMatrix3f::new(m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8])
 }
 
 fn qtm_rigid_body_tracking_valid(
@@ -1631,60 +1806,49 @@ fn qtm_rigid_body_tracking_valid(
         && rotation_matrix.into_iter().all(f32::is_finite)
 }
 
-fn encode_compact_pose(body: &MocapRigidBodySample) -> Vec<u8> {
-    let position = body.position_enu_m();
-    let attitude = body.attitude();
-    let values = [
-        position.x(),
-        position.y(),
-        position.z(),
-        attitude.x(),
-        attitude.y(),
-        attitude.z(),
-        attitude.w(),
-    ];
-    let mut payload = Vec::with_capacity(values.len() * size_of::<f32>());
-    for value in values {
-        payload.extend_from_slice(&value.to_le_bytes());
-    }
-    payload
-}
-
 fn rigid_body_statuses(
-    frame: &AssembledFrame,
+    frame: &RigidBodyFrame,
     rigid_body_names: &[String],
-) -> Result<Vec<RigidBodyStatus>> {
-    Ok(rigid_bodies(frame)?
-        .into_iter()
+) -> Vec<RigidBodyStatus> {
+    frame
+        .bodies
+        .iter()
         .map(|body| {
-            let name = usize::try_from(body.id().saturating_sub(1))
+            let name = usize::try_from(body.id.saturating_sub(1))
                 .ok()
                 .and_then(|index| rigid_body_names.get(index))
                 .filter(|name| !name.is_empty())
                 .cloned()
-                .unwrap_or_else(|| format!("id_{}", body.id()));
-            let position = body.position_enu_m();
-            let attitude = body.attitude();
+                .unwrap_or_else(|| format!("id_{}", body.id));
             RigidBodyStatus {
-                id: body.id(),
+                id: body.id,
                 name,
-                position_m: [position.x(), position.y(), position.z()],
-                quaternion: [attitude.x(), attitude.y(), attitude.z(), attitude.w()],
-                residual: body.residual(),
-                tracking_valid: body.tracking_valid(),
+                position_m: vec3_to_array(&body.position_enu_m),
+                quaternion: quat_xyzw_array(&body.attitude),
+                residual: body.residual_mm,
+                tracking_valid: body.tracking_valid,
             }
         })
-        .collect())
+        .collect()
 }
 
-fn encode_mocap_frame(frame: &AssembledFrame, selection: &BTreeSet<MocapData>) -> Result<Vec<u8>> {
+fn encode_mocap_frame(
+    frame: &AssembledFrame,
+    selection: &BTreeSet<MocapData>,
+    rigid_body_frame: Option<&RigidBodyFrame>,
+) -> Result<Vec<u8>> {
     let mut builder = FlatBufferBuilder::new();
-    let rigid_bodies = if selection.contains(&MocapData::RigidBodies) {
-        Some(builder.create_vector(&rigid_bodies(frame)?))
-    } else {
-        None
-    };
-    let labeled_markers = if selection.contains(&MocapData::LabeledMarkers) {
+    let rigid_body_data = rigid_body_frame.map(|frame| {
+        frame
+            .bodies
+            .iter()
+            .map(mocap_rigid_body_data)
+            .collect::<Vec<_>>()
+    });
+    let rigid_bodies = rigid_body_data
+        .as_ref()
+        .map(|data| builder.create_vector(data));
+    let markers = if selection.contains(&MocapData::LabeledMarkers) {
         Some(builder.create_vector(&labeled_markers(frame)?))
     } else {
         None
@@ -1694,21 +1858,25 @@ fn encode_mocap_frame(frame: &AssembledFrame, selection: &BTreeSet<MocapData>) -
     } else {
         None
     };
-    let skeleton_segments = if selection.contains(&MocapData::Skeleton) {
-        Some(builder.create_vector(&skeleton_segments(frame)?))
-    } else {
-        None
-    };
+    let drop_rate_2d_dpermille = rigid_body_frame
+        .map(|frame| frame.drop_rate_2d_dpermille)
+        .unwrap_or_default();
+    let out_of_sync_rate_2d_dpermille = rigid_body_frame
+        .map(|frame| frame.out_of_sync_rate_2d_dpermille)
+        .unwrap_or_default();
 
     let frame = MocapFrame::create(
         &mut builder,
         &MocapFrameArgs {
             timestamp_us: frame.timestamp,
             frame_number: frame.frame_number,
-            labeled_markers,
+            drop_rate_2d_dpermille,
+            out_of_sync_rate_2d_dpermille,
+            source_id: 1,
+            flags: MocapRawFlags::Valid.bits(),
+            markers,
             unlabeled_markers,
             rigid_bodies,
-            skeleton_segments,
             ..MocapFrameArgs::default()
         },
     );
@@ -1716,7 +1884,7 @@ fn encode_mocap_frame(frame: &AssembledFrame, selection: &BTreeSet<MocapData>) -
     Ok(builder.finished_data().to_vec())
 }
 
-fn labeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerSample>> {
+fn labeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerData>> {
     let component = frame
         .component(ComponentType::ThreeDResidual)
         .or_else(|| frame.component(ComponentType::ThreeD))
@@ -1728,10 +1896,16 @@ fn labeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerSample>> {
             .iter()
             .enumerate()
             .map(|(index, marker)| {
-                MocapMarkerSample::new(
+                mocap_marker_data(
                     (index + 1) as i32,
-                    &qtm_position_m(marker.x, marker.y, marker.z),
+                    marker.x,
+                    marker.y,
+                    marker.z,
                     marker.residual,
+                    true,
+                    true,
+                    false,
+                    MocapRawComponent::Marker3d,
                 )
             })
             .collect()),
@@ -1740,10 +1914,16 @@ fn labeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerSample>> {
             .iter()
             .enumerate()
             .map(|(index, marker)| {
-                MocapMarkerSample::new(
+                mocap_marker_data(
                     (index + 1) as i32,
-                    &qtm_position_m(marker.x, marker.y, marker.z),
+                    marker.x,
+                    marker.y,
+                    marker.z,
                     0.0,
+                    true,
+                    false,
+                    false,
+                    MocapRawComponent::Marker3d,
                 )
             })
             .collect()),
@@ -1751,7 +1931,7 @@ fn labeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerSample>> {
     }
 }
 
-fn unlabeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerSample>> {
+fn unlabeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerData>> {
     let component = frame
         .component(ComponentType::ThreeDNoLabelsResidual)
         .or_else(|| frame.component(ComponentType::ThreeDNoLabels))
@@ -1762,10 +1942,16 @@ fn unlabeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerSample>> {
             .markers
             .iter()
             .map(|marker| {
-                MocapMarkerSample::new(
+                mocap_marker_data(
                     marker.id,
-                    &qtm_position_m(marker.x, marker.y, marker.z),
+                    marker.x,
+                    marker.y,
+                    marker.z,
                     marker.residual,
+                    true,
+                    true,
+                    true,
+                    MocapRawComponent::Marker3dNoLabel,
                 )
             })
             .collect()),
@@ -1773,10 +1959,16 @@ fn unlabeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerSample>> {
             .markers
             .iter()
             .map(|marker| {
-                MocapMarkerSample::new(
+                mocap_marker_data(
                     marker.id,
-                    &qtm_position_m(marker.x, marker.y, marker.z),
+                    marker.x,
+                    marker.y,
+                    marker.z,
                     0.0,
+                    true,
+                    false,
+                    true,
+                    MocapRawComponent::Marker3dNoLabel,
                 )
             })
             .collect()),
@@ -1784,221 +1976,141 @@ fn unlabeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerSample>> {
     }
 }
 
-fn skeleton_segments(frame: &AssembledFrame) -> Result<Vec<MocapSegmentSample>> {
-    let component = frame
-        .component(ComponentType::Skeleton)
-        .ok_or(BridgeError::MissingComponent("skeleton"))?;
+fn mocap_marker_data(
+    id: i32,
+    x_mm: f32,
+    y_mm: f32,
+    z_mm: f32,
+    residual_mm: f32,
+    valid: bool,
+    residual_valid: bool,
+    tracking_id_valid: bool,
+    component: MocapRawComponent,
+) -> MocapMarkerData {
+    MocapMarkerData::new(
+        &qtm_position_m(x_mm, y_mm, z_mm),
+        residual_mm,
+        id,
+        mocap_raw_flags(valid, residual_valid, !tracking_id_valid, tracking_id_valid),
+        component,
+    )
+}
 
-    match &component.data {
-        ComponentData::Skeleton(component) => Ok(component
-            .skeletons
-            .iter()
-            .enumerate()
-            .flat_map(|(skeleton_index, skeleton)| {
-                skeleton.segments.iter().map(move |segment| {
-                    MocapSegmentSample::new(
-                        (skeleton_index + 1) as i32,
-                        segment.id,
-                        &qtm_position_m(segment.position.x, segment.position.y, segment.position.z),
-                        &qtm_quaternion(
-                            segment.rotation.x,
-                            segment.rotation.y,
-                            segment.rotation.z,
-                            segment.rotation.w,
-                        ),
-                        true,
-                    )
-                })
-            })
-            .collect()),
-        _ => Err(BridgeError::MissingComponent("skeleton")),
+fn mocap_rigid_body_data(body: &RigidBodyObservation) -> MocapRigidBodyData {
+    MocapRigidBodyData::new(
+        &body.position_enu_m,
+        &body.rotation,
+        body.residual_mm,
+        body.id,
+        mocap_raw_flags(body.tracking_valid, true, true, false),
+        MocapRawComponent::RigidBody6d,
+    )
+}
+
+fn mocap_raw_flags(
+    valid: bool,
+    residual_valid: bool,
+    label_valid: bool,
+    tracking_id_valid: bool,
+) -> u16 {
+    let mut flags = MocapRawFlags::empty();
+    if valid {
+        flags |= MocapRawFlags::Valid;
     }
-}
-
-fn encode_mocap_definition(
-    parameters: &MocapParameters,
-    selection: &BTreeSet<MocapData>,
-) -> Result<Vec<u8>> {
-    let mut builder = FlatBufferBuilder::new();
-    let source = builder.create_string("qualisys");
-    let frame_id = builder.create_string("qualisys");
-
-    let rigid_bodies = if selection.contains(&MocapData::RigidBodies) {
-        let definitions = parameters
-            .six_d
-            .as_ref()
-            .map(|six_d| {
-                six_d
-                    .bodies
-                    .iter()
-                    .enumerate()
-                    .map(|(index, body)| {
-                        let name = builder.create_string(&body.name);
-                        MocapRigidBodyDefinition::create(
-                            &mut builder,
-                            &MocapRigidBodyDefinitionArgs {
-                                id: (index + 1) as i32,
-                                name: Some(name),
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        Some(builder.create_vector(&definitions))
-    } else {
-        None
-    };
-
-    let labeled_markers = if selection.contains(&MocapData::LabeledMarkers) {
-        let definitions = parameters
-            .three_d
-            .as_ref()
-            .map(|three_d| {
-                three_d
-                    .labels
-                    .iter()
-                    .enumerate()
-                    .map(|(index, label)| {
-                        let name = builder.create_string(&label.name);
-                        MocapMarkerDefinition::create(
-                            &mut builder,
-                            &MocapMarkerDefinitionArgs {
-                                id: (index + 1) as i32,
-                                name: Some(name),
-                                color: label.rgb_color.unwrap_or(0),
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        Some(builder.create_vector(&definitions))
-    } else {
-        None
-    };
-
-    let skeleton_segments = if selection.contains(&MocapData::Skeleton) {
-        let definitions = skeleton_segment_definitions(parameters, &mut builder);
-        Some(builder.create_vector(&definitions))
-    } else {
-        None
-    };
-
-    let definition = MocapDefinition::create(
-        &mut builder,
-        &MocapDefinitionArgs {
-            source: Some(source),
-            frame_id: Some(frame_id),
-            labeled_markers,
-            rigid_bodies,
-            skeleton_segments,
-        },
-    );
-    builder.finish(definition, None);
-    Ok(builder.finished_data().to_vec())
-}
-
-fn skeleton_segment_definitions<'a>(
-    parameters: &MocapParameters,
-    builder: &mut FlatBufferBuilder<'a>,
-) -> Vec<flatbuffers::WIPOffset<MocapSegmentDefinition<'a>>> {
-    let mut definitions = Vec::new();
-    if let Some(skeletons) = &parameters.skeletons {
-        for (skeleton_index, skeleton) in skeletons.skeletons.iter().enumerate() {
-            append_skeleton_segment_definitions(
-                builder,
-                &mut definitions,
-                (skeleton_index + 1) as i32,
-                &skeleton.name,
-                &skeleton.segments,
-            );
-        }
+    if residual_valid {
+        flags |= MocapRawFlags::ResidualValid;
     }
-    definitions
-}
-
-fn append_skeleton_segment_definitions<'a>(
-    builder: &mut FlatBufferBuilder<'a>,
-    definitions: &mut Vec<flatbuffers::WIPOffset<MocapSegmentDefinition<'a>>>,
-    skeleton_id: i32,
-    skeleton_name: &str,
-    segments: &[MocapSkeletonSegment],
-) {
-    for (index, segment) in segments.iter().enumerate() {
-        let skeleton_name_offset = builder.create_string(skeleton_name);
-        let segment_name = builder.create_string(&segment.name);
-        definitions.push(MocapSegmentDefinition::create(
-            builder,
-            &MocapSegmentDefinitionArgs {
-                skeleton_id,
-                skeleton_name: Some(skeleton_name_offset),
-                segment_id: segment.id.unwrap_or((index + 1) as i32),
-                segment_name: Some(segment_name),
-            },
-        ));
-        append_skeleton_segment_definitions(
-            builder,
-            definitions,
-            skeleton_id,
-            skeleton_name,
-            &segment.child_segments,
-        );
+    if label_valid {
+        flags |= MocapRawFlags::LabelValid;
     }
+    if tracking_id_valid {
+        flags |= MocapRawFlags::TrackingIdValid;
+    }
+    flags.bits()
 }
 
-fn rigid_bodies(frame: &AssembledFrame) -> Result<Vec<MocapRigidBodySample>> {
+fn rigid_body_frame(frame: &AssembledFrame) -> Result<RigidBodyFrame> {
     let component = frame
         .component(ComponentType::SixDResidual)
         .or_else(|| frame.component(ComponentType::SixD))
         .ok_or(BridgeError::MissingComponent("rigid body"))?;
 
     match &component.data {
-        ComponentData::SixDResidual(component) => Ok(component
-            .bodies
-            .iter()
-            .enumerate()
-            .map(|(index, body)| {
-                let tracking_valid = qtm_rigid_body_tracking_valid(
-                    component.drop_rate,
-                    component.out_of_sync_rate,
-                    body.position.x,
-                    body.position.y,
-                    body.position.z,
-                    body.rotation_matrix,
-                );
-                MocapRigidBodySample::new(
-                    (index + 1) as i32,
-                    &qtm_position_m(body.position.x, body.position.y, body.position.z),
-                    &qtm_attitude_from_rotation_matrix(body.rotation_matrix),
-                    body.residual,
-                    tracking_valid,
-                )
-            })
-            .collect()),
-        ComponentData::SixD(component) => Ok(component
-            .bodies
-            .iter()
-            .enumerate()
-            .map(|(index, body)| {
-                let tracking_valid = qtm_rigid_body_tracking_valid(
-                    component.drop_rate,
-                    component.out_of_sync_rate,
-                    body.position.x,
-                    body.position.y,
-                    body.position.z,
-                    body.rotation_matrix,
-                );
-                MocapRigidBodySample::new(
-                    (index + 1) as i32,
-                    &qtm_position_m(body.position.x, body.position.y, body.position.z),
-                    &qtm_attitude_from_rotation_matrix(body.rotation_matrix),
-                    0.0,
-                    tracking_valid,
-                )
-            })
-            .collect()),
+        ComponentData::SixDResidual(component) => Ok(RigidBodyFrame {
+            timestamp_us: frame.timestamp,
+            frame_number: frame.frame_number,
+            drop_rate_2d_dpermille: qtm_rate_to_dpermille(component.drop_rate),
+            out_of_sync_rate_2d_dpermille: qtm_rate_to_dpermille(component.out_of_sync_rate),
+            bodies: component
+                .bodies
+                .iter()
+                .enumerate()
+                .map(|(index, body)| {
+                    rigid_body_observation(
+                        (index + 1) as i32,
+                        component.drop_rate,
+                        component.out_of_sync_rate,
+                        body.position.x,
+                        body.position.y,
+                        body.position.z,
+                        body.rotation_matrix,
+                        body.residual,
+                    )
+                })
+                .collect(),
+        }),
+        ComponentData::SixD(component) => Ok(RigidBodyFrame {
+            timestamp_us: frame.timestamp,
+            frame_number: frame.frame_number,
+            drop_rate_2d_dpermille: qtm_rate_to_dpermille(component.drop_rate),
+            out_of_sync_rate_2d_dpermille: qtm_rate_to_dpermille(component.out_of_sync_rate),
+            bodies: component
+                .bodies
+                .iter()
+                .enumerate()
+                .map(|(index, body)| {
+                    rigid_body_observation(
+                        (index + 1) as i32,
+                        component.drop_rate,
+                        component.out_of_sync_rate,
+                        body.position.x,
+                        body.position.y,
+                        body.position.z,
+                        body.rotation_matrix,
+                        0.0,
+                    )
+                })
+                .collect(),
+        }),
         _ => Err(BridgeError::MissingComponent("rigid body")),
+    }
+}
+
+fn rigid_body_observation(
+    id: i32,
+    drop_rate: i16,
+    out_of_sync_rate: i16,
+    x_mm: f32,
+    y_mm: f32,
+    z_mm: f32,
+    qtm_rotation_matrix: [f32; 9],
+    residual_mm: f32,
+) -> RigidBodyObservation {
+    let rotation = qtm_rotation_matrix_to_synapse(qtm_rotation_matrix);
+    RigidBodyObservation {
+        id,
+        position_enu_m: qtm_position_m(x_mm, y_mm, z_mm),
+        attitude: qtm_attitude_from_rotation_matrix(qtm_rotation_matrix),
+        rotation,
+        residual_mm,
+        tracking_valid: qtm_rigid_body_tracking_valid(
+            drop_rate,
+            out_of_sync_rate,
+            x_mm,
+            y_mm,
+            z_mm,
+            qtm_rotation_matrix,
+        ),
     }
 }
 
@@ -2509,6 +2621,7 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use synapse_fbs::topic::{ExternalOdometryFlags, ExternalOdometryStatus};
 
     #[test]
     fn qtm_positions_are_converted_from_millimeters_to_meters() {
@@ -2588,30 +2701,140 @@ mod tests {
     }
 
     #[test]
-    fn compact_pose_preserves_xyzw_wire_order() {
-        let body = MocapRigidBodySample::new(
+    fn external_odometry_payload_uses_fixed_layout_fields() {
+        let mut estimators =
+            ExternalOdometryEstimators::new(estimator_config(&StreamConfig::default()));
+        let body = test_observation(7, 1.0, 2.0, 3.0, qtm_quaternion(0.1, -0.2, 0.3, 0.9), true);
+
+        let payload = encode_external_odometry(&body, 123_456, 42, &mut estimators);
+        assert_eq!(payload.len(), 136);
+
+        let data = ExternalOdometryData(payload.try_into().unwrap());
+        assert_eq!(data.timestamp_us(), 123_456);
+        assert_eq!(data.last_mocap_timestamp_us(), 123_456);
+        assert_eq!(data.extrapolation_us(), 0);
+        assert_eq!(data.sequence(), 42);
+        assert_eq!(data.position_enu_m().x(), 1.0);
+        assert_eq!(data.position_enu_m().y(), 2.0);
+        assert_eq!(data.position_enu_m().z(), 3.0);
+        let attitude_norm = (0.9_f32 * 0.9 + 0.1 * 0.1 + (-0.2) * (-0.2) + 0.3 * 0.3).sqrt();
+        assert!((data.attitude().w() - 0.9 / attitude_norm).abs() < 1.0e-6);
+        assert!((data.attitude().x() - 0.1 / attitude_norm).abs() < 1.0e-6);
+        assert!((data.attitude().y() + 0.2 / attitude_norm).abs() < 1.0e-6);
+        assert!((data.attitude().z() - 0.3 / attitude_norm).abs() < 1.0e-6);
+        assert_eq!(data.status(), ExternalOdometryStatus::Filtered);
+        assert_eq!(data.frames_since_last_mocap_count(), 0);
+        assert_eq!(data.source_id(), 1);
+        assert_eq!(data.id(), 7);
+
+        let flags = ExternalOdometryFlags::from_bits_retain(data.flags());
+        assert!(flags.contains(ExternalOdometryFlags::PositionValid));
+        assert!(flags.contains(ExternalOdometryFlags::AttitudeValid));
+        assert!(!flags.contains(ExternalOdometryFlags::LinearVelocityValid));
+        assert!(!flags.contains(ExternalOdometryFlags::AngularVelocityValid));
+    }
+
+    #[test]
+    fn external_odometry_velocity_is_estimated_and_short_dropout_extrapolates() {
+        let config = StreamConfig {
+            velocity_max_gap_ms: 100,
+            velocity_min_dt_ms: 1,
+            ..StreamConfig::default()
+        };
+        let mut estimators = ExternalOdometryEstimators::new(estimator_config(&config));
+
+        let first = encode_external_odometry(
+            &test_observation(1, 0.0, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true),
+            1_000_000,
             1,
-            &Vec3f::new(1.0, 2.0, 3.0),
-            &qtm_quaternion(0.1, -0.2, 0.3, 0.9),
-            0.0,
-            true,
+            &mut estimators,
+        );
+        let first = ExternalOdometryData(first.try_into().unwrap());
+        assert!(
+            !ExternalOdometryFlags::from_bits_retain(first.flags())
+                .contains(ExternalOdometryFlags::LinearVelocityValid)
         );
 
-        let payload = encode_compact_pose(&body);
-        let value = |index: usize| {
-            f32::from_le_bytes(
-                payload[index * size_of::<f32>()..(index + 1) * size_of::<f32>()]
-                    .try_into()
-                    .unwrap(),
-            )
-        };
+        let second = encode_external_odometry(
+            &test_observation(1, 0.1, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true),
+            1_100_000,
+            2,
+            &mut estimators,
+        );
+        let second = ExternalOdometryData(second.try_into().unwrap());
+        assert!(
+            ExternalOdometryFlags::from_bits_retain(second.flags())
+                .contains(ExternalOdometryFlags::LinearVelocityValid)
+        );
+        assert!(
+            (second.linear_velocity_enu_m_s().x() - 1.0).abs() < 0.15,
+            "estimated velocity x = {}",
+            second.linear_velocity_enu_m_s().x()
+        );
 
-        assert_eq!(value(0), 1.0);
-        assert_eq!(value(1), 2.0);
-        assert_eq!(value(2), 3.0);
-        assert_eq!(value(3), 0.1);
-        assert_eq!(value(4), -0.2);
-        assert_eq!(value(5), 0.3);
-        assert_eq!(value(6), 0.9);
+        let dropout = encode_external_odometry(
+            &test_observation(1, 0.2, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), false),
+            1_150_000,
+            3,
+            &mut estimators,
+        );
+        let dropout = ExternalOdometryData(dropout.try_into().unwrap());
+        assert_eq!(dropout.status(), ExternalOdometryStatus::ExtrapolatedShort);
+        assert!(
+            ExternalOdometryFlags::from_bits_retain(dropout.flags())
+                .contains(ExternalOdometryFlags::LinearVelocityValid)
+        );
+        assert!(
+            ExternalOdometryFlags::from_bits_retain(dropout.flags())
+                .contains(ExternalOdometryFlags::Extrapolated)
+        );
+        assert!(dropout.position_enu_m().x() > second.position_enu_m().x());
+
+        let reacquired = encode_external_odometry(
+            &test_observation(1, 0.3, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true),
+            1_300_000,
+            4,
+            &mut estimators,
+        );
+        let reacquired = ExternalOdometryData(reacquired.try_into().unwrap());
+        assert!(
+            !ExternalOdometryFlags::from_bits_retain(reacquired.flags())
+                .contains(ExternalOdometryFlags::LinearVelocityValid)
+        );
+
+        let valid_again = encode_external_odometry(
+            &test_observation(1, 0.4, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true),
+            1_400_000,
+            5,
+            &mut estimators,
+        );
+        let valid_again = ExternalOdometryData(valid_again.try_into().unwrap());
+        assert!(
+            ExternalOdometryFlags::from_bits_retain(valid_again.flags())
+                .contains(ExternalOdometryFlags::LinearVelocityValid)
+        );
+        assert!(
+            (valid_again.linear_velocity_enu_m_s().x() - 1.0).abs() < 0.15,
+            "estimated velocity x = {}",
+            valid_again.linear_velocity_enu_m_s().x()
+        );
+    }
+
+    fn test_observation(
+        id: i32,
+        x_m: f32,
+        y_m: f32,
+        z_m: f32,
+        attitude: Quaternionf,
+        tracking_valid: bool,
+    ) -> RigidBodyObservation {
+        RigidBodyObservation {
+            id,
+            position_enu_m: Vec3f::new(x_m, y_m, z_m),
+            attitude,
+            rotation: RotationMatrix3f::new(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+            residual_mm: 0.0,
+            tracking_valid,
+        }
     }
 }

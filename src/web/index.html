@@ -167,20 +167,15 @@
               </label>
               <label>
                 <span class="field-label">
-                  Definition topic
-                  <span class="help" tabindex="0" data-tip="Zenoh key expression for static mocap names and definitions." aria-label="Definition topic help"
+                  External odometry prefix
+                  <span class="help" tabindex="0" data-tip="Prefix for demand-driven per-rigid-body synapse.topic.ExternalOdometryData payloads." aria-label="External odometry prefix help"
                     >?</span>
                 </span>
-                <input id="definitionTopic" name="definitionTopic" autocomplete="off" />
+                <input id="externalOdometryPrefix" name="externalOdometryPrefix" autocomplete="off" />
               </label>
-              <label>
-                <span class="field-label">
-                  Rigid body prefix
-                  <span class="help" tabindex="0" data-tip="Prefix for compact per-rigid-body pose topics." aria-label="Rigid body prefix help"
-                    >?</span>
-                </span>
-                <input id="posePrefix" name="posePrefix" autocomplete="off" />
-              </label>
+              <div class="check-row">
+                <label><input type="checkbox" id="publishExternalOdometry" /> External odometry</label>
+              </div>
             </fieldset>
 
             <fieldset>
@@ -197,7 +192,6 @@
                 <label><input type="checkbox" name="include" value="rigid-bodies" /> Rigid bodies</label>
                 <label><input type="checkbox" name="include" value="labeled-markers" /> Labeled markers</label>
                 <label><input type="checkbox" name="include" value="unlabeled-markers" /> Unlabeled markers</label>
-                <label><input type="checkbox" name="include" value="skeleton" /> Skeleton</label>
               </div>
               <label>
                 <span class="field-label">
@@ -217,6 +211,22 @@
                     >?</span>
                 </span>
                 <input id="udpBind" name="udpBind" autocomplete="off" />
+              </label>
+              <label>
+                <span class="field-label">
+                  Velocity max gap ms
+                  <span class="help" tabindex="0" data-tip="Reset computed velocity when consecutive valid mocap samples are farther apart." aria-label="Velocity max gap help"
+                    >?</span>
+                </span>
+                <input id="velocityMaxGap" name="velocityMaxGap" type="number" min="1" step="1" />
+              </label>
+              <label>
+                <span class="field-label">
+                  Velocity min dt ms
+                  <span class="help" tabindex="0" data-tip="Minimum sample spacing accepted for differentiating mocap pose." aria-label="Velocity min dt help"
+                    >?</span>
+                </span>
+                <input id="velocityMinDt" name="velocityMinDt" type="number" min="0" step="1" />
               </label>
             </fieldset>
           </form>

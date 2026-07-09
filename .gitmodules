@@ -1,0 +1,3 @@
+[submodule "third_party/modelica_models"]
+	path = third_party/modelica_models
+	url = https://github.com/CogniPilot/modelica_models
