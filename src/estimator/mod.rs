@@ -28,8 +28,6 @@ pub struct MocapExternalOdometryEstimatorConfig {
     pub min_dt_us: u64,
     pub position_stddev_m: f64,
     pub attitude_stddev_rad: f64,
-    pub linear_velocity_stddev_m_s: f64,
-    pub angular_velocity_stddev_rad_s: f64,
     pub initial_linear_velocity_stddev_m_s: f64,
     pub initial_angular_velocity_stddev_rad_s: f64,
     pub attitude_process_variance: f64,
@@ -47,8 +45,6 @@ impl Default for MocapExternalOdometryEstimatorConfig {
             min_dt_us: 1_000,
             position_stddev_m: 0.002,
             attitude_stddev_rad: 0.01,
-            linear_velocity_stddev_m_s: 0.05,
-            angular_velocity_stddev_rad_s: 0.10,
             initial_linear_velocity_stddev_m_s: 5.0,
             initial_angular_velocity_stddev_rad_s: 5.0,
             attitude_process_variance: 1.0e-6,
@@ -64,53 +60,31 @@ impl Default for MocapExternalOdometryEstimatorConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct MocapMeasurement {
     pub timestamp_us: u64,
-    pub sequence: u32,
     pub position_enu_m: [f64; 3],
     pub attitude_wxyz: [f64; 4],
     pub tracking_valid: bool,
-    pub tracking_quality_pct: u8,
 }
 
 #[derive(Debug, Clone)]
 pub struct ExternalOdometryEstimate {
     pub timestamp_us: u64,
-    pub last_mocap_timestamp_us: u64,
-    pub latency_us: u32,
-    pub extrapolation_us: u32,
-    pub sequence: u32,
     pub position_enu_m: [f32; 3],
     pub attitude_wxyz: [f32; 4],
     pub linear_velocity_enu_m_s: [f32; 3],
     pub angular_velocity_flu_rad_s: [f32; 3],
-    pub position_stddev_m: [f32; 3],
-    pub attitude_stddev_rad: [f32; 3],
-    pub linear_velocity_stddev_m_s: [f32; 3],
-    pub angular_velocity_stddev_rad_s: [f32; 3],
-    pub tracking_quality_pct: u8,
     pub status: ExternalOdometryStatus,
-    pub frames_since_last_mocap_count: u8,
     pub flags: ExternalOdometryFlags,
 }
 
 impl ExternalOdometryEstimate {
-    fn lost(timestamp_us: u64, sequence: u32) -> Self {
+    fn lost(timestamp_us: u64) -> Self {
         Self {
             timestamp_us,
-            last_mocap_timestamp_us: 0,
-            latency_us: 0,
-            extrapolation_us: 0,
-            sequence,
             position_enu_m: [0.0; 3],
             attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
             linear_velocity_enu_m_s: [0.0; 3],
             angular_velocity_flu_rad_s: [0.0; 3],
-            position_stddev_m: [0.0; 3],
-            attitude_stddev_rad: [0.0; 3],
-            linear_velocity_stddev_m_s: [0.0; 3],
-            angular_velocity_stddev_rad_s: [0.0; 3],
-            tracking_quality_pct: 0,
             status: ExternalOdometryStatus::Lost,
-            frames_since_last_mocap_count: 0,
             flags: ExternalOdometryFlags::Lost,
         }
     }
@@ -195,8 +169,6 @@ impl MocapExternalOdometryEstimator {
             self.initialize(measurement);
             return self.estimate(
                 measurement.timestamp_us,
-                measurement.sequence,
-                measurement.tracking_quality_pct,
                 ExternalOdometryStatus::Filtered,
                 false,
                 false,
@@ -208,8 +180,6 @@ impl MocapExternalOdometryEstimator {
             self.initialize(measurement);
             return self.estimate(
                 measurement.timestamp_us,
-                measurement.sequence,
-                measurement.tracking_quality_pct,
                 ExternalOdometryStatus::Filtered,
                 false,
                 false,
@@ -228,8 +198,6 @@ impl MocapExternalOdometryEstimator {
                 self.frames_since_last_mocap_count.saturating_add(1);
             return self.estimate(
                 measurement.timestamp_us,
-                measurement.sequence,
-                0,
                 ExternalOdometryStatus::OutlierRejected,
                 true,
                 true,
@@ -242,8 +210,6 @@ impl MocapExternalOdometryEstimator {
             self.twist_valid = true;
             self.estimate(
                 measurement.timestamp_us,
-                measurement.sequence,
-                measurement.tracking_quality_pct,
                 ExternalOdometryStatus::Filtered,
                 false,
                 false,
@@ -253,8 +219,6 @@ impl MocapExternalOdometryEstimator {
                 self.frames_since_last_mocap_count.saturating_add(1);
             self.estimate(
                 measurement.timestamp_us,
-                measurement.sequence,
-                0,
                 ExternalOdometryStatus::Degraded,
                 true,
                 false,
@@ -267,7 +231,7 @@ impl MocapExternalOdometryEstimator {
         measurement: MocapMeasurement,
     ) -> ExternalOdometryEstimate {
         if !self.initialized {
-            return ExternalOdometryEstimate::lost(measurement.timestamp_us, measurement.sequence);
+            return ExternalOdometryEstimate::lost(measurement.timestamp_us);
         }
 
         self.predict_to(measurement.timestamp_us);
@@ -278,8 +242,6 @@ impl MocapExternalOdometryEstimator {
         if extrapolation_us <= self.config.max_gap_us {
             self.estimate(
                 measurement.timestamp_us,
-                measurement.sequence,
-                0,
                 ExternalOdometryStatus::ExtrapolatedShort,
                 true,
                 false,
@@ -288,8 +250,6 @@ impl MocapExternalOdometryEstimator {
             self.twist_valid = false;
             self.estimate(
                 measurement.timestamp_us,
-                measurement.sequence,
-                0,
                 ExternalOdometryStatus::Lost,
                 false,
                 false,
@@ -438,8 +398,6 @@ impl MocapExternalOdometryEstimator {
     fn estimate(
         &self,
         timestamp_us: u64,
-        sequence: u32,
-        tracking_quality_pct: u8,
         status: ExternalOdometryStatus,
         extrapolated: bool,
         outlier_rejected: bool,
@@ -450,12 +408,10 @@ impl MocapExternalOdometryEstimator {
         if pose_valid {
             flags |= ExternalOdometryFlags::PositionValid;
             flags |= ExternalOdometryFlags::AttitudeValid;
-            flags |= ExternalOdometryFlags::PoseStddevValid;
         }
         if twist_valid {
             flags |= ExternalOdometryFlags::LinearVelocityValid;
             flags |= ExternalOdometryFlags::AngularVelocityValid;
-            flags |= ExternalOdometryFlags::TwistStddevValid;
         }
         if extrapolated {
             flags |= ExternalOdometryFlags::Extrapolated;
@@ -470,39 +426,13 @@ impl MocapExternalOdometryEstimator {
             flags |= ExternalOdometryFlags::Degraded;
         }
 
-        let extrapolation_us = timestamp_us
-            .saturating_sub(self.last_mocap_timestamp_us)
-            .min(u32::MAX as u64) as u32;
-        let covariance = self.covariance();
         ExternalOdometryEstimate {
             timestamp_us,
-            last_mocap_timestamp_us: self.last_mocap_timestamp_us,
-            latency_us: 0,
-            extrapolation_us,
-            sequence,
             position_enu_m: f32_array(self.position()),
             attitude_wxyz: f32_array4(self.attitude()),
             linear_velocity_enu_m_s: f32_array(self.linear_velocity()),
             angular_velocity_flu_rad_s: f32_array(self.angular_velocity()),
-            position_stddev_m: covariance_stddev3(&covariance, 6, self.config.position_stddev_m),
-            attitude_stddev_rad: covariance_stddev3(
-                &covariance,
-                0,
-                self.config.attitude_stddev_rad,
-            ),
-            linear_velocity_stddev_m_s: covariance_stddev3(
-                &covariance,
-                3,
-                self.config.linear_velocity_stddev_m_s,
-            ),
-            angular_velocity_stddev_rad_s: covariance_stddev3(
-                &covariance,
-                9,
-                self.config.angular_velocity_stddev_rad_s,
-            ),
-            tracking_quality_pct,
             status,
-            frames_since_last_mocap_count: self.frames_since_last_mocap_count,
             flags,
         }
     }
@@ -602,14 +532,6 @@ fn stabilized_covariance(covariance: Matrix12) -> Matrix12 {
         }
     }
     stabilized
-}
-
-fn covariance_stddev3(covariance: &Matrix12, offset: usize, floor: f64) -> [f32; 3] {
-    [
-        covariance[offset][offset].max(floor.powi(2)).sqrt() as f32,
-        covariance[offset + 1][offset + 1].max(floor.powi(2)).sqrt() as f32,
-        covariance[offset + 2][offset + 2].max(floor.powi(2)).sqrt() as f32,
-    ]
 }
 
 fn inverse6(mut matrix: Matrix6) -> Option<Matrix6> {
@@ -794,11 +716,9 @@ mod tests {
             MocapExternalOdometryEstimator::new(MocapExternalOdometryEstimatorConfig::default());
         estimator.initialize(MocapMeasurement {
             timestamp_us: 0,
-            sequence: 0,
             position_enu_m: [0.0, 0.0, 0.0],
             attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
             tracking_valid: true,
-            tracking_quality_pct: 100,
         });
         estimator.y[LINEAR_VELOCITY_OFFSET] = 2.0;
 
@@ -819,11 +739,9 @@ mod tests {
             MocapExternalOdometryEstimator::new(MocapExternalOdometryEstimatorConfig::default());
         let first = estimator.update(MocapMeasurement {
             timestamp_us: 1_000_000,
-            sequence: 1,
             position_enu_m: [0.0, 0.0, 0.0],
             attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
             tracking_valid: true,
-            tracking_quality_pct: 100,
         });
         assert!(
             !first
@@ -833,11 +751,9 @@ mod tests {
 
         let second = estimator.update(MocapMeasurement {
             timestamp_us: 1_100_000,
-            sequence: 2,
             position_enu_m: [0.1, 0.0, 0.0],
             attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
             tracking_valid: true,
-            tracking_quality_pct: 100,
         });
 
         assert!(
@@ -858,28 +774,22 @@ mod tests {
             MocapExternalOdometryEstimator::new(MocapExternalOdometryEstimatorConfig::default());
         estimator.update(MocapMeasurement {
             timestamp_us: 1_000_000,
-            sequence: 1,
             position_enu_m: [0.0, 0.0, 0.0],
             attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
             tracking_valid: true,
-            tracking_quality_pct: 100,
         });
         estimator.update(MocapMeasurement {
             timestamp_us: 1_100_000,
-            sequence: 2,
             position_enu_m: [0.1, 0.0, 0.0],
             attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
             tracking_valid: true,
-            tracking_quality_pct: 100,
         });
 
         let dropout = estimator.update(MocapMeasurement {
             timestamp_us: 1_150_000,
-            sequence: 3,
             position_enu_m: [0.0, 0.0, 0.0],
             attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
             tracking_valid: false,
-            tracking_quality_pct: 0,
         });
 
         assert_eq!(dropout.status, ExternalOdometryStatus::ExtrapolatedShort);

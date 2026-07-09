@@ -132,8 +132,6 @@ velocity_max_gap_ms = 100
 velocity_min_dt_ms = 1
 position_stddev_m = 0.002
 attitude_stddev_rad = 0.01
-linear_velocity_stddev_m_s = 0.05
-angular_velocity_stddev_rad_s = 0.10
 
 [zenoh]
 mode = "router"

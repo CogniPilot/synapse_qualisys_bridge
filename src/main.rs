@@ -342,8 +342,6 @@ struct StreamConfig {
     velocity_min_dt_ms: u64,
     position_stddev_m: f32,
     attitude_stddev_rad: f32,
-    linear_velocity_stddev_m_s: f32,
-    angular_velocity_stddev_rad_s: f32,
 }
 
 impl Default for StreamConfig {
@@ -357,8 +355,6 @@ impl Default for StreamConfig {
             velocity_min_dt_ms: 1,
             position_stddev_m: 0.002,
             attitude_stddev_rad: 0.01,
-            linear_velocity_stddev_m_s: 0.05,
-            angular_velocity_stddev_rad_s: 0.10,
         }
     }
 }
@@ -1583,8 +1579,6 @@ fn estimator_config(config: &StreamConfig) -> MocapExternalOdometryEstimatorConf
         min_dt_us: config.velocity_min_dt_ms.saturating_mul(1_000),
         position_stddev_m: config.position_stddev_m as f64,
         attitude_stddev_rad: config.attitude_stddev_rad as f64,
-        linear_velocity_stddev_m_s: config.linear_velocity_stddev_m_s as f64,
-        angular_velocity_stddev_rad_s: config.angular_velocity_stddev_rad_s as f64,
         ..MocapExternalOdometryEstimatorConfig::default()
     }
 }
@@ -1685,25 +1679,19 @@ fn external_odometry_topic(prefix: &str, body_id: i32) -> String {
 fn encode_external_odometry(
     body: &RigidBodyObservation,
     timestamp_us: u64,
-    sequence: u32,
+    _sequence: u32,
     estimators: &mut ExternalOdometryEstimators,
 ) -> Vec<u8> {
     let measurement = MocapMeasurement {
         timestamp_us,
-        sequence,
         position_enu_m: f64_vec3(&body.position_enu_m),
         attitude_wxyz: f64_quat(&body.attitude),
         tracking_valid: body.tracking_valid,
-        tracking_quality_pct: if body.tracking_valid { 100 } else { 0 },
     };
     let estimate = estimators.update(body.id, measurement);
 
     let data = ExternalOdometryData::new(
         estimate.timestamp_us,
-        estimate.last_mocap_timestamp_us,
-        estimate.latency_us,
-        estimate.extrapolation_us,
-        estimate.sequence,
         &Vec3f::new(
             estimate.position_enu_m[0],
             estimate.position_enu_m[1],
@@ -1725,30 +1713,8 @@ fn encode_external_odometry(
             estimate.angular_velocity_flu_rad_s[1],
             estimate.angular_velocity_flu_rad_s[2],
         ),
-        &Vec3f::new(
-            estimate.position_stddev_m[0],
-            estimate.position_stddev_m[1],
-            estimate.position_stddev_m[2],
-        ),
-        &Vec3f::new(
-            estimate.attitude_stddev_rad[0],
-            estimate.attitude_stddev_rad[1],
-            estimate.attitude_stddev_rad[2],
-        ),
-        &Vec3f::new(
-            estimate.linear_velocity_stddev_m_s[0],
-            estimate.linear_velocity_stddev_m_s[1],
-            estimate.linear_velocity_stddev_m_s[2],
-        ),
-        &RateTriplet::new(
-            estimate.angular_velocity_stddev_rad_s[0],
-            estimate.angular_velocity_stddev_rad_s[1],
-            estimate.angular_velocity_stddev_rad_s[2],
-        ),
-        estimate.tracking_quality_pct,
+        estimate.flags,
         estimate.status,
-        u16::from(estimate.frames_since_last_mocap_count),
-        estimate.flags.bits(),
         1,
         body.id.clamp(0, u8::MAX as i32) as u8,
     );
@@ -2707,13 +2673,10 @@ mod tests {
         let body = test_observation(7, 1.0, 2.0, 3.0, qtm_quaternion(0.1, -0.2, 0.3, 0.9), true);
 
         let payload = encode_external_odometry(&body, 123_456, 42, &mut estimators);
-        assert_eq!(payload.len(), 136);
+        assert_eq!(payload.len(), 64);
 
         let data = ExternalOdometryData(payload.try_into().unwrap());
         assert_eq!(data.timestamp_us(), 123_456);
-        assert_eq!(data.last_mocap_timestamp_us(), 123_456);
-        assert_eq!(data.extrapolation_us(), 0);
-        assert_eq!(data.sequence(), 42);
         assert_eq!(data.position_enu_m().x(), 1.0);
         assert_eq!(data.position_enu_m().y(), 2.0);
         assert_eq!(data.position_enu_m().z(), 3.0);
@@ -2723,11 +2686,10 @@ mod tests {
         assert!((data.attitude().y() + 0.2 / attitude_norm).abs() < 1.0e-6);
         assert!((data.attitude().z() - 0.3 / attitude_norm).abs() < 1.0e-6);
         assert_eq!(data.status(), ExternalOdometryStatus::Filtered);
-        assert_eq!(data.frames_since_last_mocap_count(), 0);
         assert_eq!(data.source_id(), 1);
         assert_eq!(data.id(), 7);
 
-        let flags = ExternalOdometryFlags::from_bits_retain(data.flags());
+        let flags = data.flags();
         assert!(flags.contains(ExternalOdometryFlags::PositionValid));
         assert!(flags.contains(ExternalOdometryFlags::AttitudeValid));
         assert!(!flags.contains(ExternalOdometryFlags::LinearVelocityValid));
@@ -2751,7 +2713,8 @@ mod tests {
         );
         let first = ExternalOdometryData(first.try_into().unwrap());
         assert!(
-            !ExternalOdometryFlags::from_bits_retain(first.flags())
+            !first
+                .flags()
                 .contains(ExternalOdometryFlags::LinearVelocityValid)
         );
 
@@ -2763,7 +2726,8 @@ mod tests {
         );
         let second = ExternalOdometryData(second.try_into().unwrap());
         assert!(
-            ExternalOdometryFlags::from_bits_retain(second.flags())
+            second
+                .flags()
                 .contains(ExternalOdometryFlags::LinearVelocityValid)
         );
         assert!(
@@ -2781,11 +2745,13 @@ mod tests {
         let dropout = ExternalOdometryData(dropout.try_into().unwrap());
         assert_eq!(dropout.status(), ExternalOdometryStatus::ExtrapolatedShort);
         assert!(
-            ExternalOdometryFlags::from_bits_retain(dropout.flags())
+            dropout
+                .flags()
                 .contains(ExternalOdometryFlags::LinearVelocityValid)
         );
         assert!(
-            ExternalOdometryFlags::from_bits_retain(dropout.flags())
+            dropout
+                .flags()
                 .contains(ExternalOdometryFlags::Extrapolated)
         );
         assert!(dropout.position_enu_m().x() > second.position_enu_m().x());
@@ -2798,7 +2764,8 @@ mod tests {
         );
         let reacquired = ExternalOdometryData(reacquired.try_into().unwrap());
         assert!(
-            !ExternalOdometryFlags::from_bits_retain(reacquired.flags())
+            !reacquired
+                .flags()
                 .contains(ExternalOdometryFlags::LinearVelocityValid)
         );
 
@@ -2810,7 +2777,8 @@ mod tests {
         );
         let valid_again = ExternalOdometryData(valid_again.try_into().unwrap());
         assert!(
-            ExternalOdometryFlags::from_bits_retain(valid_again.flags())
+            valid_again
+                .flags()
                 .contains(ExternalOdometryFlags::LinearVelocityValid)
         );
         assert!(
