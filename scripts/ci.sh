@@ -11,7 +11,7 @@ fi
 
 cd "${repo_root}"
 
-cargo fmt --all -- --check
+cargo fmt --manifest-path "${repo_root}/Cargo.toml" -- --check
 cargo clippy --locked --all-targets
 cargo test --locked
 cargo build --locked --bin synapse-qualisys-bridge
