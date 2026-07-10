@@ -90,8 +90,19 @@ request QTM components on demand.
 QTM reports mocap positions in millimeters. The bridge converts all Synapse
 positions to meters before publishing. The raw `synapse.topic.MocapFrame`
 FlatBuffer preserves source-like marker and 6D rigid-body samples for logging
-and tooling. Rigid-body samples are marked invalid when QTM reports a dropped or
-out-of-sync 6D component, or when the pose values are not finite.
+and tooling. Rigid-body samples are invalid only when the pose values are not
+finite. A nonzero QTM dropped or out-of-sync rate is retained as degraded
+quality, so a finite pose remains available for visualization while derived
+odometry reports `Degraded` rather than silently appearing lost.
+
+The bridge publishes a small JSON ID/name mapping at startup and every five
+seconds on `synapse/mocap/rigid_body_names` (configurable with
+`zenoh.rigid_body_names_topic`). This lets visualizers select a body by its QTM
+name instead of assuming a numeric ID:
+
+```json
+{"source":"qualisys","rigidBodies":[{"id":1,"name":"cub1"}]}
+```
 
 The bridge also publishes fixed-layout per-rigid-body external odometry payloads
 by default:

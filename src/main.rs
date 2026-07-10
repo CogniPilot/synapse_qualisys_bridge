@@ -61,7 +61,7 @@ Environment:
   SYNAPSE_QUALISYS_BRIDGE_CONFIG
   QUALISYS_HOST, QUALISYS_PORT, QUALISYS_TIMEOUT_MS
   ZENOH_MODE, ZENOH_CONNECT, ZENOH_LISTEN
-  ZENOH_TOPIC, ZENOH_EXTERNAL_ODOMETRY_TOPIC_PREFIX, ZENOH_NO_EXTERNAL_ODOMETRY
+  ZENOH_TOPIC, ZENOH_EXTERNAL_ODOMETRY_TOPIC_PREFIX, ZENOH_RIGID_BODY_NAMES_TOPIC, ZENOH_NO_EXTERNAL_ODOMETRY
   MOCAP_INCLUDE"
 )]
 struct Cli {
@@ -230,6 +230,14 @@ struct ZenohArgs {
     external_odometry_topic_prefix: Option<String>,
 
     #[arg(
+        long = "rigid-body-names-topic",
+        env = "ZENOH_RIGID_BODY_NAMES_TOPIC",
+        value_name = "KEYEXPR",
+        help = "Zenoh key expression for JSON rigid-body ID/name metadata"
+    )]
+    rigid_body_names_topic: Option<String>,
+
+    #[arg(
         long = "no-external-odometry",
         alias = "no-rigid-body-pose-topics",
         env = "ZENOH_NO_EXTERNAL_ODOMETRY",
@@ -367,6 +375,7 @@ struct ZenohConfig {
     listen: String,
     topic: String,
     external_odometry_topic_prefix: String,
+    rigid_body_names_topic: String,
     no_external_odometry: bool,
     admin_query_timeout_ms: u64,
 }
@@ -379,6 +388,7 @@ impl Default for ZenohConfig {
             listen: "udp/0.0.0.0:7447,tcp/0.0.0.0:7447".to_owned(),
             topic: "synapse/v1/topic/mocap_frame".to_owned(),
             external_odometry_topic_prefix: "synapse/v1/topic/external_odometry".to_owned(),
+            rigid_body_names_topic: "synapse/mocap/rigid_body_names".to_owned(),
             no_external_odometry: false,
             admin_query_timeout_ms: 1_000,
         }
@@ -919,6 +929,7 @@ struct ZenohAccess {
     subscriber_endpoints: Vec<String>,
     frame_topic: String,
     external_odometry_topic_prefix: String,
+    rigid_body_names_topic: String,
     sample_key_expr: String,
     example_subscriber_args: Option<String>,
 }
@@ -1180,6 +1191,9 @@ fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
     if let Some(prefix) = cli.zenoh.external_odometry_topic_prefix.as_ref() {
         config.zenoh.external_odometry_topic_prefix = prefix.clone();
     }
+    if let Some(topic) = cli.zenoh.rigid_body_names_topic.as_ref() {
+        config.zenoh.rigid_body_names_topic = topic.clone();
+    }
     if cli.zenoh.no_external_odometry {
         config.zenoh.no_external_odometry = true;
     }
@@ -1253,6 +1267,10 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
         .declare_publisher(config.zenoh.topic.clone())
         .wait()
         .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
+    let rigid_body_names_publisher = session
+        .declare_publisher(config.zenoh.rigid_body_names_topic.clone())
+        .wait()
+        .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
 
     app.set_qualisys_status(
         "connecting",
@@ -1275,6 +1293,17 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
     let selection = selected_data(config);
     let parameters = client.get_mocap_parameters()?;
     let rigid_body_names = rigid_body_names(&parameters);
+    let rigid_body_names_payload = encode_rigid_body_names(&rigid_body_names)?;
+    rigid_body_names_publisher
+        .put(rigid_body_names_payload.clone())
+        .wait()
+        .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
+    app.record_topic(
+        config.zenoh.rigid_body_names_topic.clone(),
+        "rigid body name metadata publisher",
+        rigid_body_names_payload.len(),
+    );
+    let mut next_rigid_body_names_publish = Instant::now() + Duration::from_secs(5);
 
     let components = stream_components(&selection);
     let request = StreamFramesRequest::new(
@@ -1299,6 +1328,18 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
     let mut odometry_estimators = ExternalOdometryEstimators::new(estimator_config(&config.stream));
     let mut odometry_publishers = ExternalOdometryPublishers::default();
     while !stop.load(Ordering::SeqCst) {
+        if Instant::now() >= next_rigid_body_names_publish {
+            rigid_body_names_publisher
+                .put(rigid_body_names_payload.clone())
+                .wait()
+                .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
+            app.record_topic(
+                config.zenoh.rigid_body_names_topic.clone(),
+                "rigid body name metadata publisher",
+                rigid_body_names_payload.len(),
+            );
+            next_rigid_body_names_publish = Instant::now() + Duration::from_secs(5);
+        }
         match client.recv_stream_packet()? {
             StreamPacket::Data(packet) => {
                 for frame in accumulator.push(packet) {
@@ -1408,6 +1449,7 @@ fn zenoh_access(config: &AppConfig) -> ZenohAccess {
         subscriber_endpoints,
         frame_topic: config.zenoh.topic.clone(),
         external_odometry_topic_prefix: config.zenoh.external_odometry_topic_prefix.clone(),
+        rigid_body_names_topic: config.zenoh.rigid_body_names_topic.clone(),
         sample_key_expr,
         example_subscriber_args,
     }
@@ -1441,6 +1483,7 @@ fn subscription_key_expr(config: &AppConfig) -> String {
     let topics = [
         config.zenoh.topic.as_str(),
         config.zenoh.external_odometry_topic_prefix.as_str(),
+        config.zenoh.rigid_body_names_topic.as_str(),
     ];
     let parts: Vec<Vec<&str>> = topics
         .iter()
@@ -1554,6 +1597,17 @@ fn rigid_body_names(parameters: &MocapParameters) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn encode_rigid_body_names(names: &[String]) -> Result<Vec<u8>> {
+    serde_json::to_vec(&serde_json::json!({
+        "source": "qualisys",
+        "rigidBodies": names.iter().enumerate().map(|(index, name)| serde_json::json!({
+            "id": index + 1,
+            "name": name,
+        })).collect::<Vec<_>>(),
+    }))
+    .map_err(|error| BridgeError::Config(error.to_string()))
+}
+
 #[derive(Debug, Clone)]
 struct RigidBodyFrame {
     timestamp_us: u64,
@@ -1571,6 +1625,7 @@ struct RigidBodyObservation {
     rotation: RotationMatrix3f,
     residual_mm: f32,
     tracking_valid: bool,
+    quality_degraded: bool,
 }
 
 fn estimator_config(config: &StreamConfig) -> MocapExternalOdometryEstimatorConfig {
@@ -1687,6 +1742,7 @@ fn encode_external_odometry(
         position_enu_m: f64_vec3(&body.position_enu_m),
         attitude_wxyz: f64_quat(&body.attitude),
         tracking_valid: body.tracking_valid,
+        quality_degraded: body.quality_degraded,
     };
     let estimate = estimators.update(body.id, measurement);
 
@@ -1759,17 +1815,19 @@ fn qtm_rotation_matrix_to_synapse(m: [f32; 9]) -> RotationMatrix3f {
 }
 
 fn qtm_rigid_body_tracking_valid(
-    drop_rate: i16,
-    out_of_sync_rate: i16,
+    _drop_rate: i16,
+    _out_of_sync_rate: i16,
     x_mm: f32,
     y_mm: f32,
     z_mm: f32,
     rotation_matrix: [f32; 9],
 ) -> bool {
-    drop_rate == 0
-        && out_of_sync_rate == 0
-        && [x_mm, y_mm, z_mm].into_iter().all(f32::is_finite)
+    [x_mm, y_mm, z_mm].into_iter().all(f32::is_finite)
         && rotation_matrix.into_iter().all(f32::is_finite)
+}
+
+fn qtm_rigid_body_quality_degraded(drop_rate: i16, out_of_sync_rate: i16) -> bool {
+    drop_rate > 0 || out_of_sync_rate > 0
 }
 
 fn rigid_body_statuses(
@@ -2077,6 +2135,7 @@ fn rigid_body_observation(
             z_mm,
             qtm_rotation_matrix,
         ),
+        quality_degraded: qtm_rigid_body_quality_degraded(drop_rate, out_of_sync_rate),
     }
 }
 
@@ -2599,16 +2658,15 @@ mod tests {
     }
 
     #[test]
-    fn rigid_body_tracking_valid_rejects_dropped_or_invalid_data() {
+    fn rigid_body_tracking_accepts_finite_data_and_marks_transport_quality() {
         let rotation = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 
         assert!(qtm_rigid_body_tracking_valid(0, 0, 1.0, 2.0, 3.0, rotation));
-        assert!(!qtm_rigid_body_tracking_valid(
-            1, 0, 1.0, 2.0, 3.0, rotation
-        ));
-        assert!(!qtm_rigid_body_tracking_valid(
-            0, 1, 1.0, 2.0, 3.0, rotation
-        ));
+        assert!(qtm_rigid_body_tracking_valid(1, 0, 1.0, 2.0, 3.0, rotation));
+        assert!(qtm_rigid_body_tracking_valid(0, 1, 1.0, 2.0, 3.0, rotation));
+        assert!(qtm_rigid_body_quality_degraded(1, 0));
+        assert!(qtm_rigid_body_quality_degraded(0, 1));
+        assert!(!qtm_rigid_body_quality_degraded(0, 0));
         assert!(!qtm_rigid_body_tracking_valid(
             0,
             0,
@@ -2803,6 +2861,7 @@ mod tests {
             rotation: RotationMatrix3f::new(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
             residual_mm: 0.0,
             tracking_valid,
+            quality_degraded: false,
         }
     }
 }
