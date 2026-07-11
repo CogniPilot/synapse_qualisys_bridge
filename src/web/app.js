@@ -287,10 +287,18 @@ function odometryNode(body) {
   const status = document.createElement("span");
   status.className = `odom-status ${odometryStatusClass(body.status)}`;
   status.textContent = body.status;
+  const poseRawBadge = topicBadge("pose_raw", body.pose_raw);
   const poseBadge = topicBadge("pose", body.pose);
+  const poseCovBadge = topicBadge("pose_cov", body.pose_cov);
+  const twistBadge = topicBadge("twist", body.twist);
+  const twistCovBadge = topicBadge("twist_cov", body.twist_cov);
   const odomBadge = topicBadge("odom", body.odom);
+  const odomCovBadge = topicBadge("odom_cov", body.odom_cov);
   const topic = document.createElement("code");
-  topic.textContent = `${body.pose?.topic || ""} · ${body.odom?.topic || ""}`;
+  topic.textContent =
+    `${body.pose_raw?.topic || ""} · ${body.pose?.topic || ""} · ${body.pose_cov?.topic || ""}` +
+    ` · ${body.twist?.topic || ""} · ${body.twist_cov?.topic || ""}` +
+    ` · ${body.odom?.topic || ""} · ${body.odom_cov?.topic || ""}`;
 
   const meta = document.createElement("p");
   meta.className = "odom-meta";
@@ -304,7 +312,18 @@ function odometryNode(body) {
   const covariance = body.covariance || [];
   return collapsible(
     key,
-    [name, status, poseBadge, odomBadge, topic],
+    [
+      name,
+      status,
+      poseRawBadge,
+      poseBadge,
+      poseCovBadge,
+      twistBadge,
+      twistCovBadge,
+      odomBadge,
+      odomCovBadge,
+      topic,
+    ],
     [
       meta,
       vectorGroup(`${key}:pos`, "Position (ENU m)", body.position_enu_m, covariance, COV_POSITION),
@@ -334,7 +353,7 @@ function renderOdometry(odometry) {
   if (!odometry.length) {
     const empty = document.createElement("p");
     empty.className = "subtle odom-empty";
-    empty.textContent = "No external odometry estimates yet";
+    empty.textContent = "No pose or odometry estimates yet";
     container.append(empty);
     return;
   }
@@ -402,6 +421,9 @@ async function loadConfig() {
   $("velocityMaxGap").value = cfg.stream.velocity_max_gap_ms;
   $("velocityMinDt").value = cfg.stream.velocity_min_dt_ms;
   $("degradedThreshold").value = cfg.stream.degraded_rate_threshold_dpermille;
+  for (const checkbox of document.querySelectorAll("input[name='include']")) {
+    checkbox.checked = cfg.stream.include.includes(checkbox.value);
+  }
 }
 
 function readConfigForm() {
@@ -418,6 +440,12 @@ function readConfigForm() {
   cfg.stream.velocity_max_gap_ms = Number($("velocityMaxGap").value);
   cfg.stream.velocity_min_dt_ms = Number($("velocityMinDt").value);
   cfg.stream.degraded_rate_threshold_dpermille = Number($("degradedThreshold").value);
+  cfg.stream.include = [
+    "rigid-bodies",
+    ...Array.from(
+      document.querySelectorAll("input[name='include']:checked:not([value='rigid-bodies'])"),
+    ).map((checkbox) => checkbox.value),
+  ];
   return cfg;
 }
 

@@ -160,7 +160,7 @@
               <label>
                 <span class="field-label">
                   Namespace
-                  <span class="help" tabindex="0" data-tip="Namespace prepended to the per-rigid-body <namespace>/<body_name>/pose and <namespace>/<body_name>/odom key expressions." aria-label="Namespace help"
+                  <span class="help" tabindex="0" data-tip="Namespace prepended to mocap and the per-rigid-body pose_raw, pose, pose_cov, twist, twist_cov, odom, and odom_cov topics." aria-label="Namespace help"
                     >?</span>
                 </span>
                 <input id="zenohNamespace" name="zenohNamespace" autocomplete="off" />
@@ -173,10 +173,15 @@
                 <span
                   class="help"
                   tabindex="0"
-                  data-tip="The bridge continuously requests the QTM 6DOF rigid-body component; Zenoh subscribers do not request it on demand."
+                  data-tip="The bridge always requests QTM 6DOF rigid bodies; optionally include labeled and unlabeled markers in the raw mocap frame."
                   aria-label="QTM stream help"
                   >?</span>
               </legend>
+              <div class="check-row">
+                <label><input type="checkbox" name="include" value="rigid-bodies" disabled checked /> Rigid bodies</label>
+                <label><input type="checkbox" name="include" value="labeled-markers" /> Labeled markers</label>
+                <label><input type="checkbox" name="include" value="unlabeled-markers" /> Unlabeled markers</label>
+              </div>
               <label>
                 <span class="field-label">
                   Transport
@@ -267,12 +272,12 @@
       <section class="panel">
         <div class="panel-title">
           <h2>
-            External Odometry
+            Pose and Odometry
             <span
               class="help"
               tabindex="0"
-              data-tip="Kalman filter estimate per rigid body. Click a body to inspect position, attitude, velocities, and covariance. The pose and odom topics each publish once a subscriber matches their key expression."
-              aria-label="External odometry help"
+              data-tip="Raw QTM pose and Kalman filter estimate per rigid body. pose_raw is unfiltered; pose, twist, and odometry variants are filter outputs and publish only when subscribed."
+              aria-label="Pose and odometry help"
               >?</span>
           </h2>
         </div>

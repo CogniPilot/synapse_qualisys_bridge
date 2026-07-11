@@ -8,6 +8,7 @@ port = 22223
 timeout_ms = 5000
 
 [stream]
+include = ["rigid-bodies"]
 transport = "udp"
 degraded_rate_threshold_dpermille = 100
 udp_bind = "0.0.0.0:0"

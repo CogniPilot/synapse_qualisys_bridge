@@ -75,11 +75,23 @@ test("odometry debug view exposes Kalman filter state", async ({ page }) => {
   await expect(covariance.locator(".cov-table")).toBeVisible();
 });
 
-test("bridge publishes mocap and external odometry over real Zenoh", async () => {
+test("bridge publishes mocap, pose, twist, and odometry over real Zenoh", async () => {
+  await waitForZenohSample("qualisys/mocap", 20_000);
+  await waitForZenohSample("qualisys/sim_body_1/pose_raw", 20_000);
   await waitForZenohSample("qualisys/sim_body_1/pose", 20_000);
+  await waitForZenohSample("qualisys/sim_body_1/pose_cov", 20_000);
+  await waitForZenohSample("qualisys/sim_body_1/twist", 20_000);
+  await waitForZenohSample("qualisys/sim_body_1/twist_cov", 20_000);
   await waitForZenohSample("qualisys/sim_body_1/odom", 20_000);
+  await waitForZenohSample("qualisys/sim_body_1/odom_cov", 20_000);
   await waitForZenohSample("qualisys/sim_body_2/pose", 20_000);
 
+  await expect
+    .poll(async () => {
+      const status = await getJson(`${ctx.webUrl}/api/status`);
+      return status.topics.map((topic) => topic.key_expr);
+    }, { timeout: 10_000 })
+    .toContain("qualisys/sim_body_1/pose_raw");
   await expect
     .poll(async () => {
       const status = await getJson(`${ctx.webUrl}/api/status`);
@@ -91,7 +103,37 @@ test("bridge publishes mocap and external odometry over real Zenoh", async () =>
       const status = await getJson(`${ctx.webUrl}/api/status`);
       return status.topics.map((topic) => topic.key_expr);
     }, { timeout: 10_000 })
+    .toContain("qualisys/sim_body_1/pose_cov");
+  await expect
+    .poll(async () => {
+      const status = await getJson(`${ctx.webUrl}/api/status`);
+      return status.topics.map((topic) => topic.key_expr);
+    }, { timeout: 10_000 })
+    .toContain("qualisys/sim_body_1/twist");
+  await expect
+    .poll(async () => {
+      const status = await getJson(`${ctx.webUrl}/api/status`);
+      return status.topics.map((topic) => topic.key_expr);
+    }, { timeout: 10_000 })
+    .toContain("qualisys/sim_body_1/twist_cov");
+  await expect
+    .poll(async () => {
+      const status = await getJson(`${ctx.webUrl}/api/status`);
+      return status.topics.map((topic) => topic.key_expr);
+    }, { timeout: 10_000 })
     .toContain("qualisys/sim_body_1/odom");
+  await expect
+    .poll(async () => {
+      const status = await getJson(`${ctx.webUrl}/api/status`);
+      return status.topics.map((topic) => topic.key_expr);
+    }, { timeout: 10_000 })
+    .toContain("qualisys/sim_body_1/odom_cov");
+  await expect
+    .poll(async () => {
+      const status = await getJson(`${ctx.webUrl}/api/status`);
+      return status.topics.map((topic) => topic.key_expr);
+    }, { timeout: 10_000 })
+    .toContain("qualisys/mocap");
 });
 
 async function startStack() {

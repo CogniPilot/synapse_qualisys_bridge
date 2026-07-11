@@ -47,32 +47,51 @@ Useful defaults can also come from environment variables:
 QUALISYS_HOST=127.0.0.1 cargo run --bin synapse-qualisys-bridge
 ```
 
-The bridge publishes two topics per tracked rigid body, nested under the
-mocap system's namespace as the synapse_fbs 0.6 README recommends for
-infrastructure sources:
+The bridge publishes seven demand-driven topics per tracked rigid body plus the
+raw mocap frame, nested under the mocap system's namespace:
 
 ```text
-qualisys/<body_name>/pose   # synapse.topic.ExternalOdometryData (64 bytes)
-qualisys/<body_name>/odom   # synapse.topic.OdometryEstimateData (232 bytes)
+qualisys/mocap                  # synapse.topic.MocapPoseFrame (table)
+qualisys/<body_name>/pose_raw   # synapse.topic.RawPoseData (40 bytes)
+qualisys/<body_name>/pose       # synapse.topic.PoseData (40 bytes, filtered)
+qualisys/<body_name>/pose_cov   # synapse.topic.PoseWithCovarianceData (120 bytes)
+qualisys/<body_name>/twist      # synapse.topic.TwistData (32 bytes)
+qualisys/<body_name>/twist_cov  # synapse.topic.TwistWithCovarianceData (120 bytes)
+qualisys/<body_name>/odom       # synapse.topic.OdometryData (72 bytes)
+qualisys/<body_name>/odom_cov   # synapse.topic.OdometryWithCovarianceData (384 bytes)
 ```
 
-`pose` carries the pose/twist estimator input; `odom` carries the full
-Kalman filter estimate including the pose and velocity covariance blocks,
-reset counter, and quality percentage. The `pose` key is a deliberate
-deviation from the catalog's curated `external_pose` key; consumers identify
-payload types from the mandatory value contract, not the key. Run
+`pose_raw` carries the Qualisys position and quaternion exactly as received,
+after frame/unit conversion, with no filter and no covariance. `pose` and
+`pose_cov` carry the filter-state pose and its marginal covariance. `twist`
+and `twist_cov` carry filter-derived linear and angular velocity. `odom`
+carries the compact coherent filter state and status with no covariance,
+while `odom_cov` adds its full 12×12 covariance, including pose–twist
+cross-correlations. `mocap` carries the raw QTM frame with quaternion rigid-body
+attitudes, residuals, ids, validity, frame number, QTM loss rates, and any
+configured marker components. Run
 `cargo run --bin synapse-qualisys-bridge -- --help` for all options.
+
+Each top-level payload has one `timestamp_us`. Nested `Posef`, `Twistf`, and
+rigid-body samples inherit that timestamp, so odometry and mocap frames do not
+repeat timestamps in every nested value.
 
 Example subscriber configuration from another machine:
 
 ```text
 endpoint: udp/<bridge-pc-ip>:7447
-key expression: qualisys/<body_name>/pose   # estimator input for one vehicle
-key expression: qualisys/<body_name>/odom   # full estimate with covariance
-key expression: qualisys/**                 # everything from this bridge
+key expression: qualisys/mocap                  # complete raw mocap frame
+key expression: qualisys/<body_name>/pose_raw   # unfiltered Qualisys pose, no covariance
+key expression: qualisys/<body_name>/pose       # filtered pose, no covariance
+key expression: qualisys/<body_name>/pose_cov   # filtered pose and covariance
+key expression: qualisys/<body_name>/twist      # filtered linear/angular velocity
+key expression: qualisys/<body_name>/twist_cov  # filtered twist and covariance
+key expression: qualisys/<body_name>/odom       # filtered pose/twist, no covariance
+key expression: qualisys/<body_name>/odom_cov   # filtered state and full 12x12 covariance
+key expression: qualisys/**                     # everything from this bridge
 ```
 
-Every published Zenoh value carries the synapse_fbs 0.6 value contract
+Every published Zenoh value carries the synapse_fbs 0.7 value contract
 encoding
 (`<media-type>;type=<wire-type>;schema=sha256-128:<hash>`), so catalog-aware
 consumers can validate payloads before decoding.
@@ -92,10 +111,12 @@ Run from a configuration file:
 synapse-qualisys-bridge --config bridge.toml --open
 ```
 
-The bridge continuously requests the QTM 6DOF rigid-body component. QTM
-reports mocap positions in millimeters; the bridge converts all Synapse
-positions to meters before publishing. Rigid-body samples are invalid only
-when the pose values are not finite.
+The bridge continuously requests the QTM 6DOF rigid-body component. Add
+`--include labeled-markers,unlabeled-markers` (or configure `stream.include`)
+to include marker components in `qualisys/mocap`. QTM reports positions in
+millimeters; the bridge converts all Synapse positions to meters before
+publishing. Rigid-body samples are invalid only when pose values are not
+finite.
 
 `<body_name>` is the QTM rigid-body name sanitized to a lowercase snake_case
 Zenoh key segment (`Cub 1` becomes `cub_1`), with a `body_<id>` fallback for
@@ -107,8 +128,9 @@ The estimator runs for every tracked body so the dashboard's External
 Odometry panel can display the live Kalman filter state (position, attitude,
 velocities, the full 12x12 covariance, reset counter, quality, and the raw
 QTM 2D drop and out-of-sync rates); each Zenoh publication stays
-demand-driven, only sending a body's `pose` or `odom` payloads while Zenoh
-reports a matching subscriber for that key expression. The estimator is a 12D
+demand-driven, only sending `mocap` or a body's pose, twist, or odometry
+variant while Zenoh reports a matching subscriber for that key expression.
+The estimator is a 12D
 Lie/error-state EKF prediction model generated from the
 `Estimation.Examples.MocapExternalOdometryIEKF` Modelica example in the pinned
 `third_party/modelica_models` submodule. It estimates position, attitude,

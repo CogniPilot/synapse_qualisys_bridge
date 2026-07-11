@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::mem::size_of;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,6 +21,7 @@ use estimator::{
     CovarianceMatrix, ExternalOdometryEstimate, ExternalOdometryEstimators,
     MocapExternalOdometryEstimatorConfig, MocapMeasurement,
 };
+use flatbuffers::FlatBufferBuilder;
 use qualisys_rust_sdk::rt::{
     AssembledFrame, Client, ClientOptions, ComponentData, ComponentSelection, ComponentType,
     FrameAccumulator, MocapParameters, StreamFramesRequest, StreamPacket, StreamRate,
@@ -27,8 +29,16 @@ use qualisys_rust_sdk::rt::{
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use synapse_fbs::synapse::types::{CovarianceUpperTriangle21f, Quaternionf, RateTriplet, Vec3f};
-use synapse_fbs::topic::{ExternalOdometryData, ExternalOdometryFlags, OdometryEstimateData};
+use synapse_fbs::synapse::types::{
+    CovarianceUpperTriangle21f, CovarianceUpperTriangle78f, Posef, Quaternionf, RateTriplet,
+    Twistf, Vec3f,
+};
+use synapse_fbs::topic::{
+    ExternalOdometryFlags, MocapMarkerData, MocapPoseFrame, MocapPoseFrameArgs, MocapRawComponent,
+    MocapRawFlags, MocapRigidBodyPoseData, OdometryData, OdometryFlags, OdometryStatus,
+    OdometryWithCovarianceData, PoseData, PoseWithCovarianceData, RawPoseData, TwistData,
+    TwistWithCovarianceData,
+};
 use synapse_fbs::topic_catalog::{self, TopicInfo};
 use synapse_fbs::value_contract;
 use thiserror::Error;
@@ -52,8 +62,8 @@ const QTM_MILLIMETERS_TO_METERS: f32 = 0.001;
     version,
     about = "Bridge Qualisys QTM RT mocap data to Synapse FlatBuffers on Zenoh",
     long_about = "Runs a controllable local web interface, listens to a Qualisys QTM RT rigid-body \
-stream, and publishes per-body synapse.topic.ExternalOdometryData and \
-synapse.topic.OdometryEstimateData payloads on Zenoh under the mocap system's namespace.",
+stream, and publishes raw pose, filtered odometry, covariance, and complete mocap-frame payloads \
+on Zenoh under the mocap system's namespace.",
     next_line_help = true,
     after_help = "\
 Examples:
@@ -126,6 +136,14 @@ struct QualisysArgs {
 #[derive(Debug, Parser)]
 #[command(next_help_heading = "QTM Stream")]
 struct StreamArgs {
+    #[arg(
+        long = "include",
+        value_enum,
+        value_delimiter = ',',
+        help = "QTM components included in the raw mocap stream: rigid-bodies, labeled-markers, unlabeled-markers"
+    )]
+    include: Vec<MocapData>,
+
     #[arg(long, value_enum, help = "Transport used for QTM streamframes")]
     transport: Option<StreamTransportArg>,
 
@@ -147,7 +165,7 @@ struct StreamArgs {
         long = "velocity-max-gap-ms",
         env = "VELOCITY_MAX_GAP_MS",
         value_name = "MS",
-        help = "Maximum valid-sample gap before ExternalOdometry twist is reset"
+        help = "Maximum valid-sample gap before the filtered twist is reset"
     )]
     velocity_max_gap_ms: Option<u64>,
 
@@ -174,6 +192,14 @@ struct StreamArgs {
 enum StreamTransportArg {
     Udp,
     Tcp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum MocapData {
+    RigidBodies,
+    LabeledMarkers,
+    UnlabeledMarkers,
 }
 
 #[derive(Debug, Parser)]
@@ -208,8 +234,7 @@ struct ZenohArgs {
         long = "namespace",
         env = "ZENOH_NAMESPACE",
         value_name = "NAMESPACE",
-        help = "Namespace prepended to the per-rigid-body \
-                <namespace>/<body_name>/{pose,odom} key expressions"
+        help = "Namespace prepended to per-body pose, twist, and odometry topics and the mocap frame"
     )]
     namespace: Option<String>,
 }
@@ -309,6 +334,7 @@ impl Default for QualisysConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct StreamConfig {
+    include: Vec<MocapData>,
     transport: StreamTransportArg,
     degraded_rate_threshold_dpermille: u16,
     udp_bind: SocketAddr,
@@ -322,6 +348,7 @@ struct StreamConfig {
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
+            include: vec![MocapData::RigidBodies],
             transport: StreamTransportArg::Udp,
             degraded_rate_threshold_dpermille: 100,
             udp_bind: "0.0.0.0:0".parse().expect("valid default UDP bind"),
@@ -358,19 +385,45 @@ impl Default for ZenohConfig {
 
 /// Per the synapse_fbs README, an infrastructure source owns its own
 /// namespace; per-tracked-vehicle outputs nest a vehicle sub-namespace
-/// (`qualisys/cub1/external_pose`, `qualisys/cub1/odom`).
+/// (`qualisys/cub1/pose`, `qualisys/cub1/odom`).
 fn default_namespace() -> String {
     "qualisys".to_owned()
 }
 
-fn external_odometry_topic_info() -> &'static TopicInfo {
-    topic_catalog::topic_by_name("ExternalOdometry")
-        .expect("ExternalOdometry in synapse_fbs topic catalog")
+fn pose_topic_info() -> &'static TopicInfo {
+    topic_catalog::topic_by_name("Pose").expect("Pose in synapse_fbs topic catalog")
 }
 
-fn odometry_estimate_topic_info() -> &'static TopicInfo {
-    topic_catalog::topic_by_name("OdometryEstimate")
-        .expect("OdometryEstimate in synapse_fbs topic catalog")
+fn raw_pose_topic_info() -> &'static TopicInfo {
+    topic_catalog::topic_by_name("RawPose").expect("RawPose in synapse_fbs topic catalog")
+}
+
+fn pose_with_covariance_topic_info() -> &'static TopicInfo {
+    topic_catalog::topic_by_name("PoseWithCovariance")
+        .expect("PoseWithCovariance in synapse_fbs topic catalog")
+}
+
+fn twist_topic_info() -> &'static TopicInfo {
+    topic_catalog::topic_by_name("Twist").expect("Twist in synapse_fbs topic catalog")
+}
+
+fn twist_with_covariance_topic_info() -> &'static TopicInfo {
+    topic_catalog::topic_by_name("TwistWithCovariance")
+        .expect("TwistWithCovariance in synapse_fbs topic catalog")
+}
+
+fn odometry_topic_info() -> &'static TopicInfo {
+    topic_catalog::topic_by_name("Odometry").expect("Odometry in synapse_fbs topic catalog")
+}
+
+fn odometry_with_covariance_topic_info() -> &'static TopicInfo {
+    topic_catalog::topic_by_name("OdometryWithCovariance")
+        .expect("OdometryWithCovariance in synapse_fbs topic catalog")
+}
+
+fn mocap_frame_topic_info() -> &'static TopicInfo {
+    topic_catalog::topic_by_name("MocapPoseFrame")
+        .expect("MocapPoseFrame in synapse_fbs topic catalog")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -962,8 +1015,13 @@ struct RigidBodyStatus {
 struct OdometryDebugStatus {
     id: i32,
     name: String,
+    pose_raw: TopicPublicationStatus,
     pose: TopicPublicationStatus,
+    pose_cov: TopicPublicationStatus,
+    twist: TopicPublicationStatus,
+    twist_cov: TopicPublicationStatus,
     odom: TopicPublicationStatus,
+    odom_cov: TopicPublicationStatus,
     timestamp_us: u64,
     status: String,
     flags: Vec<String>,
@@ -1389,6 +1447,12 @@ fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
     if let Some(transport) = cli.stream.transport {
         config.stream.transport = transport;
     }
+    if !cli.stream.include.is_empty() {
+        config.stream.include = cli.stream.include.clone();
+        if !config.stream.include.contains(&MocapData::RigidBodies) {
+            config.stream.include.insert(0, MocapData::RigidBodies);
+        }
+    }
     if let Some(udp_bind) = cli.stream.udp_bind {
         config.stream.udp_bind = udp_bind;
     }
@@ -1503,7 +1567,8 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
     let parameters = client.get_mocap_parameters()?;
     let rigid_body_names = rigid_body_names(&parameters);
 
-    let components = vec![ComponentSelection::SixDResidual];
+    let selection = selected_data(config);
+    let components = stream_components(&selection);
     let request = StreamFramesRequest::new(
         StreamRate::AllFrames,
         stream_transport(config),
@@ -1526,12 +1591,39 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
     let mut odometry_estimators = ExternalOdometryEstimators::new(estimator_config(&config.stream));
     let mut odometry_publishers =
         BodyOdometryPublishers::new(external_odometry_namespaces(&rigid_body_names));
+    let mocap_publisher = session
+        .declare_publisher(namespaced_topic(
+            &config.zenoh.namespace,
+            mocap_frame_topic_info().key,
+        ))
+        .encoding(value_contract::encoding_for_topic(mocap_frame_topic_info()))
+        .wait()
+        .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
     while !stop.load(Ordering::SeqCst) {
         match client.recv_stream_packet()? {
             StreamPacket::Data(packet) => {
                 for frame in accumulator.push(packet) {
                     let rigid_body_frame =
                         rigid_body_frame(&frame, config.stream.degraded_rate_threshold_dpermille)?;
+
+                    if mocap_publisher
+                        .matching_status()
+                        .wait()
+                        .map_err(|error| BridgeError::Zenoh(error.to_string()))?
+                        .matching()
+                    {
+                        let payload = encode_mocap_frame(&frame, &selection, &rigid_body_frame)?;
+                        let payload_len = payload.len();
+                        mocap_publisher
+                            .put(payload)
+                            .wait()
+                            .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
+                        app.record_topic(
+                            mocap_publisher.key_expr().to_string(),
+                            "raw mocap publisher",
+                            payload_len,
+                        );
+                    }
 
                     let odometry = publish_body_odometry(
                         &session,
@@ -1709,6 +1801,23 @@ fn stream_transport(config: &AppConfig) -> StreamTransport {
     }
 }
 
+fn selected_data(config: &AppConfig) -> BTreeSet<MocapData> {
+    let mut selected: BTreeSet<_> = config.stream.include.iter().copied().collect();
+    selected.insert(MocapData::RigidBodies);
+    selected
+}
+
+fn stream_components(selection: &BTreeSet<MocapData>) -> Vec<ComponentSelection> {
+    let mut components = vec![ComponentSelection::SixDResidual];
+    if selection.contains(&MocapData::LabeledMarkers) {
+        components.push(ComponentSelection::ThreeDResidual);
+    }
+    if selection.contains(&MocapData::UnlabeledMarkers) {
+        components.push(ComponentSelection::ThreeDNoLabelsResidual);
+    }
+    components
+}
+
 fn rigid_body_names(parameters: &MocapParameters) -> Vec<String> {
     parameters
         .six_d
@@ -1751,33 +1860,44 @@ fn estimator_config(config: &StreamConfig) -> MocapExternalOdometryEstimatorConf
     }
 }
 
-/// Deployment key for the per-body pose/twist measurement. `pose` is a
-/// deliberate deviation from the catalog's curated `external_pose` key; the
-/// payload stays `synapse.topic.ExternalOdometryData` and the mandatory
-/// value-contract encoding identifies it on the wire.
-const POSE_TOPIC_KEY: &str = "pose";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum BodyTopicKind {
+    RawPose,
     Pose,
+    PoseCov,
+    Twist,
+    TwistCov,
     Odom,
+    OdomCov,
 }
 
 impl BodyTopicKind {
     fn key(self) -> &'static str {
         match self {
-            BodyTopicKind::Pose => POSE_TOPIC_KEY,
-            BodyTopicKind::Odom => odometry_estimate_topic_info().key,
+            BodyTopicKind::RawPose => raw_pose_topic_info().key,
+            BodyTopicKind::Pose => pose_topic_info().key,
+            BodyTopicKind::PoseCov => pose_with_covariance_topic_info().key,
+            BodyTopicKind::Twist => twist_topic_info().key,
+            BodyTopicKind::TwistCov => twist_with_covariance_topic_info().key,
+            BodyTopicKind::Odom => odometry_topic_info().key,
+            BodyTopicKind::OdomCov => odometry_with_covariance_topic_info().key,
         }
     }
 
     fn encoding(self) -> String {
         match self {
-            BodyTopicKind::Pose => {
-                value_contract::encoding_for_topic(external_odometry_topic_info())
+            BodyTopicKind::RawPose => value_contract::encoding_for_topic(raw_pose_topic_info()),
+            BodyTopicKind::Pose => value_contract::encoding_for_topic(pose_topic_info()),
+            BodyTopicKind::PoseCov => {
+                value_contract::encoding_for_topic(pose_with_covariance_topic_info())
             }
-            BodyTopicKind::Odom => {
-                value_contract::encoding_for_topic(odometry_estimate_topic_info())
+            BodyTopicKind::Twist => value_contract::encoding_for_topic(twist_topic_info()),
+            BodyTopicKind::TwistCov => {
+                value_contract::encoding_for_topic(twist_with_covariance_topic_info())
+            }
+            BodyTopicKind::Odom => value_contract::encoding_for_topic(odometry_topic_info()),
+            BodyTopicKind::OdomCov => {
+                value_contract::encoding_for_topic(odometry_with_covariance_topic_info())
             }
         }
     }
@@ -1883,10 +2003,29 @@ fn publish_body_odometry(
         // and per topic.
         let estimate = update_estimate(body, frame.timestamp_us, estimators);
 
+        let pose_raw_subscribed =
+            publishers.has_matching_subscriber(session, config, body.id, BodyTopicKind::RawPose)?;
+        if pose_raw_subscribed && body.tracking_valid {
+            let payload = raw_pose_payload(body, frame.timestamp_us);
+            outcome.published.push(publishers.publish(
+                session,
+                config,
+                body.id,
+                BodyTopicKind::RawPose,
+                payload,
+            )?);
+        }
+
+        let pose_valid = estimate
+            .flags
+            .contains(ExternalOdometryFlags::PositionValid)
+            && estimate
+                .flags
+                .contains(ExternalOdometryFlags::AttitudeValid);
         let pose_subscribed =
             publishers.has_matching_subscriber(session, config, body.id, BodyTopicKind::Pose)?;
-        if pose_subscribed {
-            let payload = external_odometry_payload(&estimate, body.id);
+        if pose_subscribed && pose_valid {
+            let payload = pose_payload(&estimate);
             outcome.published.push(publishers.publish(
                 session,
                 config,
@@ -1896,10 +2035,59 @@ fn publish_body_odometry(
             )?);
         }
 
+        let pose_cov_subscribed =
+            publishers.has_matching_subscriber(session, config, body.id, BodyTopicKind::PoseCov)?;
+        if pose_cov_subscribed && pose_valid {
+            let payload = pose_with_covariance_payload(&estimate);
+            outcome.published.push(publishers.publish(
+                session,
+                config,
+                body.id,
+                BodyTopicKind::PoseCov,
+                payload,
+            )?);
+        }
+
+        let twist_valid = estimate
+            .flags
+            .contains(ExternalOdometryFlags::LinearVelocityValid)
+            && estimate
+                .flags
+                .contains(ExternalOdometryFlags::AngularVelocityValid);
+        let twist_subscribed =
+            publishers.has_matching_subscriber(session, config, body.id, BodyTopicKind::Twist)?;
+        if twist_subscribed && twist_valid {
+            let payload = twist_payload(&estimate);
+            outcome.published.push(publishers.publish(
+                session,
+                config,
+                body.id,
+                BodyTopicKind::Twist,
+                payload,
+            )?);
+        }
+
+        let twist_cov_subscribed = publishers.has_matching_subscriber(
+            session,
+            config,
+            body.id,
+            BodyTopicKind::TwistCov,
+        )?;
+        if twist_cov_subscribed && twist_valid {
+            let payload = twist_with_covariance_payload(&estimate);
+            outcome.published.push(publishers.publish(
+                session,
+                config,
+                body.id,
+                BodyTopicKind::TwistCov,
+                payload,
+            )?);
+        }
+
         let odom_subscribed =
             publishers.has_matching_subscriber(session, config, body.id, BodyTopicKind::Odom)?;
         if odom_subscribed {
-            let payload = odometry_estimate_payload(&estimate);
+            let payload = odometry_payload(&estimate);
             outcome.published.push(publishers.publish(
                 session,
                 config,
@@ -1909,17 +2097,50 @@ fn publish_body_odometry(
             )?);
         }
 
+        let odom_cov_subscribed =
+            publishers.has_matching_subscriber(session, config, body.id, BodyTopicKind::OdomCov)?;
+        if odom_cov_subscribed {
+            let payload = odometry_with_covariance_payload(&estimate);
+            outcome.published.push(publishers.publish(
+                session,
+                config,
+                body.id,
+                BodyTopicKind::OdomCov,
+                payload,
+            )?);
+        }
+
         outcome.debug.push(odometry_debug_status(
             body,
             frame,
             rigid_body_names,
             TopicPublicationStatus {
+                topic: publishers.topic(config, body.id, BodyTopicKind::RawPose),
+                subscribed: pose_raw_subscribed,
+            },
+            TopicPublicationStatus {
                 topic: publishers.topic(config, body.id, BodyTopicKind::Pose),
                 subscribed: pose_subscribed,
             },
             TopicPublicationStatus {
+                topic: publishers.topic(config, body.id, BodyTopicKind::PoseCov),
+                subscribed: pose_cov_subscribed,
+            },
+            TopicPublicationStatus {
+                topic: publishers.topic(config, body.id, BodyTopicKind::Twist),
+                subscribed: twist_subscribed,
+            },
+            TopicPublicationStatus {
+                topic: publishers.topic(config, body.id, BodyTopicKind::TwistCov),
+                subscribed: twist_cov_subscribed,
+            },
+            TopicPublicationStatus {
                 topic: publishers.topic(config, body.id, BodyTopicKind::Odom),
                 subscribed: odom_subscribed,
+            },
+            TopicPublicationStatus {
+                topic: publishers.topic(config, body.id, BodyTopicKind::OdomCov),
+                subscribed: odom_cov_subscribed,
             },
             &estimate,
         ));
@@ -1934,6 +2155,15 @@ fn body_topic(namespace: &str, body_namespace: &str, key: &str) -> String {
         format!("{body_namespace}/{key}")
     } else {
         format!("{namespace}/{body_namespace}/{key}")
+    }
+}
+
+fn namespaced_topic(namespace: &str, key: &str) -> String {
+    let namespace = namespace.trim_matches('/');
+    if namespace.is_empty() {
+        key.to_owned()
+    } else {
+        format!("{namespace}/{key}")
     }
 }
 
@@ -2003,15 +2233,25 @@ fn odometry_debug_status(
     body: &RigidBodyObservation,
     frame: &RigidBodyFrame,
     rigid_body_names: &[String],
+    pose_raw: TopicPublicationStatus,
     pose: TopicPublicationStatus,
+    pose_cov: TopicPublicationStatus,
+    twist: TopicPublicationStatus,
+    twist_cov: TopicPublicationStatus,
     odom: TopicPublicationStatus,
+    odom_cov: TopicPublicationStatus,
     estimate: &ExternalOdometryEstimate,
 ) -> OdometryDebugStatus {
     OdometryDebugStatus {
         id: body.id,
         name: rigid_body_display_name(body.id, rigid_body_names),
+        pose_raw,
         pose,
+        pose_cov,
+        twist,
+        twist_cov,
         odom,
+        odom_cov,
         timestamp_us: estimate.timestamp_us,
         status: estimate
             .status
@@ -2055,16 +2295,6 @@ fn external_odometry_flag_names(flags: ExternalOdometryFlags) -> Vec<String> {
     .collect()
 }
 
-/// Producer-defined estimator identifier: the Rumoca-generated 12D mocap
-/// IEKF.
-const ODOMETRY_ESTIMATOR_TYPE: u8 = 1;
-
-/// Rows/columns of the 12x12 tangent covariance selected for the
-/// OdometryEstimateData pose block ([x, y, z, rot x, rot y, rot z]).
-const POSE_COVARIANCE_ORDER: [usize; 6] = [6, 7, 8, 0, 1, 2];
-/// Selection for the velocity block ([vx, vy, vz, wx, wy, wz]).
-const VELOCITY_COVARIANCE_ORDER: [usize; 6] = [3, 4, 5, 9, 10, 11];
-
 fn update_estimate(
     body: &RigidBodyObservation,
     timestamp_us: u64,
@@ -2082,39 +2312,85 @@ fn update_estimate(
     )
 }
 
-fn external_odometry_payload(estimate: &ExternalOdometryEstimate, body_id: i32) -> Vec<u8> {
-    let data = ExternalOdometryData::new(
-        estimate.timestamp_us,
-        &estimate_position(estimate),
-        &estimate_attitude(estimate),
-        &estimate_velocity(estimate),
-        &estimate_angular_velocity(estimate),
-        estimate.flags,
-        estimate.status,
-        1,
-        body_id.clamp(0, u8::MAX as i32) as u8,
-    );
-    data.0.to_vec()
+fn raw_pose_payload(body: &RigidBodyObservation, timestamp_us: u64) -> Vec<u8> {
+    RawPoseData::new(timestamp_us, &observation_pose(body))
+        .0
+        .to_vec()
 }
 
-fn odometry_estimate_payload(estimate: &ExternalOdometryEstimate) -> Vec<u8> {
-    let data = OdometryEstimateData::new(
+fn pose_payload(estimate: &ExternalOdometryEstimate) -> Vec<u8> {
+    PoseData::new(estimate.timestamp_us, &estimate_pose(estimate))
+        .0
+        .to_vec()
+}
+
+fn pose_with_covariance_payload(estimate: &ExternalOdometryEstimate) -> Vec<u8> {
+    PoseWithCovarianceData::new(
         estimate.timestamp_us,
-        &estimate_position(estimate),
-        &estimate_attitude(estimate),
-        &estimate_velocity(estimate),
-        &estimate_angular_velocity(estimate),
-        &covariance_upper_triangle(&estimate.covariance, POSE_COVARIANCE_ORDER),
-        &covariance_upper_triangle(&estimate.covariance, VELOCITY_COVARIANCE_ORDER),
+        &estimate_pose(estimate),
+        &covariance_upper_triangle6(&estimate.covariance, POSE_COVARIANCE_ORDER),
+    )
+    .0
+    .to_vec()
+}
+
+fn twist_payload(estimate: &ExternalOdometryEstimate) -> Vec<u8> {
+    TwistData::new(estimate.timestamp_us, &estimate_twist(estimate))
+        .0
+        .to_vec()
+}
+
+fn twist_with_covariance_payload(estimate: &ExternalOdometryEstimate) -> Vec<u8> {
+    TwistWithCovarianceData::new(
+        estimate.timestamp_us,
+        &estimate_twist(estimate),
+        &covariance_upper_triangle6(&estimate.covariance, TWIST_COVARIANCE_ORDER),
+    )
+    .0
+    .to_vec()
+}
+
+fn odometry_payload(estimate: &ExternalOdometryEstimate) -> Vec<u8> {
+    OdometryData::new(
+        estimate.timestamp_us,
+        &estimate_pose(estimate),
+        &estimate_twist(estimate),
+        odometry_flags(estimate.flags),
+        odometry_status(estimate.status),
         estimate.reset_counter,
         ODOMETRY_ESTIMATOR_TYPE,
         odometry_quality_pct(estimate),
-    );
-    data.0.to_vec()
+    )
+    .0
+    .to_vec()
 }
 
+fn odometry_with_covariance_payload(estimate: &ExternalOdometryEstimate) -> Vec<u8> {
+    OdometryWithCovarianceData::new(
+        estimate.timestamp_us,
+        &estimate_pose(estimate),
+        &estimate_twist(estimate),
+        &covariance_upper_triangle12(&estimate.covariance, ODOMETRY_COVARIANCE_ORDER),
+        odometry_flags(estimate.flags),
+        odometry_status(estimate.status),
+        estimate.reset_counter,
+        ODOMETRY_ESTIMATOR_TYPE,
+        odometry_quality_pct(estimate),
+    )
+    .0
+    .to_vec()
+}
+
+/// Producer-defined estimator identifier: the Rumoca-generated 12D mocap
+/// IEKF.
+const ODOMETRY_ESTIMATOR_TYPE: u8 = 1;
+
+const POSE_COVARIANCE_ORDER: [usize; 6] = [6, 7, 8, 0, 1, 2];
+const TWIST_COVARIANCE_ORDER: [usize; 6] = [3, 4, 5, 9, 10, 11];
+const ODOMETRY_COVARIANCE_ORDER: [usize; 12] = [6, 7, 8, 0, 1, 2, 3, 4, 5, 9, 10, 11];
+
 /// Coarse quality mapping from the estimate status for
-/// OdometryEstimateData.quality_pct; negative means unknown.
+/// Dashboard quality percentage; negative means unknown.
 fn odometry_quality_pct(estimate: &ExternalOdometryEstimate) -> i8 {
     use synapse_fbs::topic::ExternalOdometryStatus;
     match estimate.status {
@@ -2127,73 +2403,98 @@ fn odometry_quality_pct(estimate: &ExternalOdometryEstimate) -> i8 {
     }
 }
 
-fn covariance_upper_triangle(
+fn odometry_flags(flags: ExternalOdometryFlags) -> OdometryFlags {
+    OdometryFlags::from_bits_retain(flags.bits())
+}
+
+fn odometry_status(status: synapse_fbs::topic::ExternalOdometryStatus) -> OdometryStatus {
+    use synapse_fbs::topic::ExternalOdometryStatus;
+    match status {
+        ExternalOdometryStatus::Filtered => OdometryStatus::Filtered,
+        ExternalOdometryStatus::ExtrapolatedShort => OdometryStatus::ExtrapolatedShort,
+        ExternalOdometryStatus::ExtrapolatedLong => OdometryStatus::ExtrapolatedLong,
+        ExternalOdometryStatus::Lost => OdometryStatus::Lost,
+        ExternalOdometryStatus::OutlierRejected => OdometryStatus::OutlierRejected,
+        ExternalOdometryStatus::Degraded => OdometryStatus::Degraded,
+        _ => OdometryStatus::Unknown,
+    }
+}
+
+fn covariance_upper_triangle6(
     covariance: &CovarianceMatrix,
     order: [usize; 6],
 ) -> CovarianceUpperTriangle21f {
-    let mut elements = [0.0_f32; 21];
+    let mut result = CovarianceUpperTriangle21f::default();
     let mut index = 0;
     for row in 0..6 {
         for col in row..6 {
-            elements[index] = covariance[order[row]][order[col]] as f32;
+            write_covariance_element(
+                &mut result.0,
+                index,
+                covariance[order[row]][order[col]] as f32,
+            );
             index += 1;
         }
     }
-    CovarianceUpperTriangle21f::new(
-        elements[0],
-        elements[1],
-        elements[2],
-        elements[3],
-        elements[4],
-        elements[5],
-        elements[6],
-        elements[7],
-        elements[8],
-        elements[9],
-        elements[10],
-        elements[11],
-        elements[12],
-        elements[13],
-        elements[14],
-        elements[15],
-        elements[16],
-        elements[17],
-        elements[18],
-        elements[19],
-        elements[20],
+    result
+}
+
+fn covariance_upper_triangle12(
+    covariance: &CovarianceMatrix,
+    order: [usize; 12],
+) -> CovarianceUpperTriangle78f {
+    let mut result = CovarianceUpperTriangle78f::default();
+    let mut index = 0;
+    for row in 0..12 {
+        for col in row..12 {
+            write_covariance_element(
+                &mut result.0,
+                index,
+                covariance[order[row]][order[col]] as f32,
+            );
+            index += 1;
+        }
+    }
+    result
+}
+
+fn write_covariance_element(bytes: &mut [u8], index: usize, value: f32) {
+    let offset = index * size_of::<f32>();
+    bytes[offset..offset + size_of::<f32>()].copy_from_slice(&value.to_le_bytes());
+}
+
+fn observation_pose(body: &RigidBodyObservation) -> Posef {
+    Posef::new(&body.position_enu_m, &body.attitude)
+}
+
+fn estimate_pose(estimate: &ExternalOdometryEstimate) -> Posef {
+    Posef::new(
+        &Vec3f::new(
+            estimate.position_enu_m[0],
+            estimate.position_enu_m[1],
+            estimate.position_enu_m[2],
+        ),
+        &Quaternionf::new(
+            estimate.attitude_wxyz[0],
+            estimate.attitude_wxyz[1],
+            estimate.attitude_wxyz[2],
+            estimate.attitude_wxyz[3],
+        ),
     )
 }
 
-fn estimate_position(estimate: &ExternalOdometryEstimate) -> Vec3f {
-    Vec3f::new(
-        estimate.position_enu_m[0],
-        estimate.position_enu_m[1],
-        estimate.position_enu_m[2],
-    )
-}
-
-fn estimate_attitude(estimate: &ExternalOdometryEstimate) -> Quaternionf {
-    Quaternionf::new(
-        estimate.attitude_wxyz[0],
-        estimate.attitude_wxyz[1],
-        estimate.attitude_wxyz[2],
-        estimate.attitude_wxyz[3],
-    )
-}
-
-fn estimate_velocity(estimate: &ExternalOdometryEstimate) -> Vec3f {
-    Vec3f::new(
-        estimate.linear_velocity_enu_m_s[0],
-        estimate.linear_velocity_enu_m_s[1],
-        estimate.linear_velocity_enu_m_s[2],
-    )
-}
-
-fn estimate_angular_velocity(estimate: &ExternalOdometryEstimate) -> RateTriplet {
-    RateTriplet::new(
-        estimate.angular_velocity_flu_rad_s[0],
-        estimate.angular_velocity_flu_rad_s[1],
-        estimate.angular_velocity_flu_rad_s[2],
+fn estimate_twist(estimate: &ExternalOdometryEstimate) -> Twistf {
+    Twistf::new(
+        &Vec3f::new(
+            estimate.linear_velocity_enu_m_s[0],
+            estimate.linear_velocity_enu_m_s[1],
+            estimate.linear_velocity_enu_m_s[2],
+        ),
+        &RateTriplet::new(
+            estimate.angular_velocity_flu_rad_s[0],
+            estimate.angular_velocity_flu_rad_s[1],
+            estimate.angular_velocity_flu_rad_s[2],
+        ),
     )
 }
 
@@ -2279,6 +2580,190 @@ fn rigid_body_statuses(
             tracking_valid: body.tracking_valid,
         })
         .collect()
+}
+
+fn encode_mocap_frame(
+    frame: &AssembledFrame,
+    selection: &BTreeSet<MocapData>,
+    rigid_bodies: &RigidBodyFrame,
+) -> Result<Vec<u8>> {
+    let mut builder = FlatBufferBuilder::new();
+    let bodies = rigid_bodies
+        .bodies
+        .iter()
+        .map(mocap_rigid_body_data)
+        .collect::<Vec<_>>();
+    let bodies = builder.create_vector(&bodies);
+    let markers = if selection.contains(&MocapData::LabeledMarkers) {
+        Some(builder.create_vector(&labeled_markers(frame)?))
+    } else {
+        None
+    };
+    let unlabeled_markers = if selection.contains(&MocapData::UnlabeledMarkers) {
+        Some(builder.create_vector(&unlabeled_markers(frame)?))
+    } else {
+        None
+    };
+    let valid = rigid_bodies.bodies.iter().all(|body| body.tracking_valid);
+    let frame = MocapPoseFrame::create(
+        &mut builder,
+        &MocapPoseFrameArgs {
+            timestamp_us: frame.timestamp,
+            frame_number: frame.frame_number,
+            drop_rate_2d_dpermille: rigid_bodies.drop_rate_2d_dpermille,
+            out_of_sync_rate_2d_dpermille: rigid_bodies.out_of_sync_rate_2d_dpermille,
+            source_id: 1,
+            flags: if valid {
+                MocapRawFlags::Valid.bits()
+            } else {
+                MocapRawFlags::empty().bits()
+            },
+            markers,
+            unlabeled_markers,
+            rigid_bodies: Some(bodies),
+            ..MocapPoseFrameArgs::default()
+        },
+    );
+    builder.finish(frame, None);
+    Ok(builder.finished_data().to_vec())
+}
+
+fn mocap_rigid_body_data(body: &RigidBodyObservation) -> MocapRigidBodyPoseData {
+    let mut flags = MocapRawFlags::ResidualValid | MocapRawFlags::LabelValid;
+    if body.tracking_valid {
+        flags |= MocapRawFlags::Valid;
+    }
+    MocapRigidBodyPoseData::new(
+        &observation_pose(body),
+        body.residual_mm,
+        body.id,
+        flags.bits(),
+    )
+}
+
+fn labeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerData>> {
+    let component = frame
+        .component(ComponentType::ThreeDResidual)
+        .or_else(|| frame.component(ComponentType::ThreeD))
+        .ok_or(BridgeError::MissingComponent("labeled marker"))?;
+
+    match &component.data {
+        ComponentData::ThreeDResidual(component) => Ok(component
+            .markers
+            .iter()
+            .enumerate()
+            .map(|(index, marker)| {
+                mocap_marker_data(
+                    (index + 1) as i32,
+                    marker.x,
+                    marker.y,
+                    marker.z,
+                    marker.residual,
+                    true,
+                    true,
+                    false,
+                    MocapRawComponent::Marker3d,
+                )
+            })
+            .collect()),
+        ComponentData::ThreeD(component) => Ok(component
+            .markers
+            .iter()
+            .enumerate()
+            .map(|(index, marker)| {
+                mocap_marker_data(
+                    (index + 1) as i32,
+                    marker.x,
+                    marker.y,
+                    marker.z,
+                    0.0,
+                    true,
+                    false,
+                    false,
+                    MocapRawComponent::Marker3d,
+                )
+            })
+            .collect()),
+        _ => Err(BridgeError::MissingComponent("labeled marker")),
+    }
+}
+
+fn unlabeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerData>> {
+    let component = frame
+        .component(ComponentType::ThreeDNoLabelsResidual)
+        .or_else(|| frame.component(ComponentType::ThreeDNoLabels))
+        .ok_or(BridgeError::MissingComponent("unlabeled marker"))?;
+
+    match &component.data {
+        ComponentData::ThreeDNoLabelsResidual(component) => Ok(component
+            .markers
+            .iter()
+            .map(|marker| {
+                mocap_marker_data(
+                    marker.id,
+                    marker.x,
+                    marker.y,
+                    marker.z,
+                    marker.residual,
+                    true,
+                    true,
+                    true,
+                    MocapRawComponent::Marker3dNoLabel,
+                )
+            })
+            .collect()),
+        ComponentData::ThreeDNoLabels(component) => Ok(component
+            .markers
+            .iter()
+            .map(|marker| {
+                mocap_marker_data(
+                    marker.id,
+                    marker.x,
+                    marker.y,
+                    marker.z,
+                    0.0,
+                    true,
+                    false,
+                    true,
+                    MocapRawComponent::Marker3dNoLabel,
+                )
+            })
+            .collect()),
+        _ => Err(BridgeError::MissingComponent("unlabeled marker")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mocap_marker_data(
+    id: i32,
+    x_mm: f32,
+    y_mm: f32,
+    z_mm: f32,
+    residual_mm: f32,
+    valid: bool,
+    residual_valid: bool,
+    tracking_id_valid: bool,
+    component: MocapRawComponent,
+) -> MocapMarkerData {
+    let mut flags = MocapRawFlags::empty();
+    if valid {
+        flags |= MocapRawFlags::Valid;
+    }
+    if residual_valid {
+        flags |= MocapRawFlags::ResidualValid;
+    }
+    if tracking_id_valid {
+        flags |= MocapRawFlags::TrackingIdValid;
+    } else {
+        flags |= MocapRawFlags::LabelValid;
+    }
+    MocapMarkerData::new(
+        &qtm_position_m(x_mm, y_mm, z_mm),
+        residual_mm,
+        id,
+        flags.bits(),
+        component,
+    )
 }
 
 fn rigid_body_frame(
@@ -2887,7 +3372,6 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use synapse_fbs::topic::{ExternalOdometryFlags, ExternalOdometryStatus};
 
     #[test]
     fn qtm_positions_are_converted_from_millimeters_to_meters() {
@@ -2960,43 +3444,44 @@ mod tests {
     }
 
     #[test]
-    fn external_odometry_payload_uses_fixed_layout_fields() {
+    fn odometry_payload_uses_compact_fixed_layout_fields() {
         let mut estimators =
             ExternalOdometryEstimators::new(estimator_config(&StreamConfig::default()));
         let body = test_observation(7, 1.0, 2.0, 3.0, qtm_quaternion(0.1, -0.2, 0.3, 0.9), true);
 
-        let payload = encode_pose(&body, 123_456, &mut estimators);
-        assert_eq!(payload.len(), 64);
+        let payload = encode_odometry(&body, 123_456, &mut estimators);
+        assert_eq!(payload.len(), 72);
         assert_eq!(
             payload.len(),
-            external_odometry_topic_info()
+            odometry_topic_info()
                 .payload_size
                 .expect("catalog payload size"),
         );
 
-        let data = ExternalOdometryData(payload.try_into().unwrap());
+        let data = OdometryData(payload.try_into().unwrap());
         assert_eq!(data.timestamp_us(), 123_456);
-        assert_eq!(data.position_enu_m().x(), 1.0);
-        assert_eq!(data.position_enu_m().y(), 2.0);
-        assert_eq!(data.position_enu_m().z(), 3.0);
+        assert_eq!(data.pose().position_enu_m().x(), 1.0);
+        assert_eq!(data.pose().position_enu_m().y(), 2.0);
+        assert_eq!(data.pose().position_enu_m().z(), 3.0);
         let attitude_norm = (0.9_f32 * 0.9 + 0.1 * 0.1 + (-0.2) * (-0.2) + 0.3 * 0.3).sqrt();
-        assert!((data.attitude().w() - 0.9 / attitude_norm).abs() < 1.0e-6);
-        assert!((data.attitude().x() - 0.1 / attitude_norm).abs() < 1.0e-6);
-        assert!((data.attitude().y() + 0.2 / attitude_norm).abs() < 1.0e-6);
-        assert!((data.attitude().z() - 0.3 / attitude_norm).abs() < 1.0e-6);
-        assert_eq!(data.status(), ExternalOdometryStatus::Filtered);
-        assert_eq!(data.source_id(), 1);
-        assert_eq!(data.id(), 7);
+        assert!((data.pose().attitude().w() - 0.9 / attitude_norm).abs() < 1.0e-6);
+        assert!((data.pose().attitude().x() - 0.1 / attitude_norm).abs() < 1.0e-6);
+        assert!((data.pose().attitude().y() + 0.2 / attitude_norm).abs() < 1.0e-6);
+        assert!((data.pose().attitude().z() - 0.3 / attitude_norm).abs() < 1.0e-6);
+        assert_eq!(data.status(), OdometryStatus::Filtered);
+        assert_eq!(data.reset_counter(), 0);
+        assert_eq!(data.estimator_type(), ODOMETRY_ESTIMATOR_TYPE);
+        assert_eq!(data.quality_pct(), 100);
 
         let flags = data.flags();
-        assert!(flags.contains(ExternalOdometryFlags::PositionValid));
-        assert!(flags.contains(ExternalOdometryFlags::AttitudeValid));
-        assert!(!flags.contains(ExternalOdometryFlags::LinearVelocityValid));
-        assert!(!flags.contains(ExternalOdometryFlags::AngularVelocityValid));
+        assert!(flags.contains(OdometryFlags::PositionValid));
+        assert!(flags.contains(OdometryFlags::AttitudeValid));
+        assert!(!flags.contains(OdometryFlags::LinearVelocityValid));
+        assert!(!flags.contains(OdometryFlags::AngularVelocityValid));
     }
 
     #[test]
-    fn external_odometry_velocity_is_estimated_and_short_dropout_extrapolates() {
+    fn odometry_velocity_is_estimated_and_short_dropout_extrapolates() {
         let config = StreamConfig {
             velocity_max_gap_ms: 100,
             velocity_min_dt_ms: 1,
@@ -3004,81 +3489,65 @@ mod tests {
         };
         let mut estimators = ExternalOdometryEstimators::new(estimator_config(&config));
 
-        let first = encode_pose(
+        let first = encode_odometry(
             &test_observation(1, 0.0, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true),
             1_000_000,
             &mut estimators,
         );
-        let first = ExternalOdometryData(first.try_into().unwrap());
-        assert!(
-            !first
-                .flags()
-                .contains(ExternalOdometryFlags::LinearVelocityValid)
-        );
+        let first = OdometryData(first.try_into().unwrap());
+        assert!(!first.flags().contains(OdometryFlags::LinearVelocityValid));
 
-        let second = encode_pose(
+        let second = encode_odometry(
             &test_observation(1, 0.1, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true),
             1_100_000,
             &mut estimators,
         );
-        let second = ExternalOdometryData(second.try_into().unwrap());
+        let second = OdometryData(second.try_into().unwrap());
+        assert!(second.flags().contains(OdometryFlags::LinearVelocityValid));
         assert!(
-            second
-                .flags()
-                .contains(ExternalOdometryFlags::LinearVelocityValid)
-        );
-        assert!(
-            (second.linear_velocity_enu_m_s().x() - 1.0).abs() < 0.15,
+            (second.twist().linear_velocity_enu_m_s().x() - 1.0).abs() < 0.15,
             "estimated velocity x = {}",
-            second.linear_velocity_enu_m_s().x()
+            second.twist().linear_velocity_enu_m_s().x()
         );
 
-        let dropout = encode_pose(
+        let dropout = encode_odometry(
             &test_observation(1, 0.2, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), false),
             1_150_000,
             &mut estimators,
         );
-        let dropout = ExternalOdometryData(dropout.try_into().unwrap());
-        assert_eq!(dropout.status(), ExternalOdometryStatus::ExtrapolatedShort);
-        assert!(
-            dropout
-                .flags()
-                .contains(ExternalOdometryFlags::LinearVelocityValid)
-        );
-        assert!(
-            dropout
-                .flags()
-                .contains(ExternalOdometryFlags::Extrapolated)
-        );
-        assert!(dropout.position_enu_m().x() > second.position_enu_m().x());
+        let dropout = OdometryData(dropout.try_into().unwrap());
+        assert_eq!(dropout.status(), OdometryStatus::ExtrapolatedShort);
+        assert!(dropout.flags().contains(OdometryFlags::LinearVelocityValid));
+        assert!(dropout.flags().contains(OdometryFlags::Extrapolated));
+        assert!(dropout.pose().position_enu_m().x() > second.pose().position_enu_m().x());
 
-        let reacquired = encode_pose(
+        let reacquired = encode_odometry(
             &test_observation(1, 0.3, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true),
             1_300_000,
             &mut estimators,
         );
-        let reacquired = ExternalOdometryData(reacquired.try_into().unwrap());
+        let reacquired = OdometryData(reacquired.try_into().unwrap());
         assert!(
             !reacquired
                 .flags()
-                .contains(ExternalOdometryFlags::LinearVelocityValid)
+                .contains(OdometryFlags::LinearVelocityValid)
         );
 
-        let valid_again = encode_pose(
+        let valid_again = encode_odometry(
             &test_observation(1, 0.4, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true),
             1_400_000,
             &mut estimators,
         );
-        let valid_again = ExternalOdometryData(valid_again.try_into().unwrap());
+        let valid_again = OdometryData(valid_again.try_into().unwrap());
         assert!(
             valid_again
                 .flags()
-                .contains(ExternalOdometryFlags::LinearVelocityValid)
+                .contains(OdometryFlags::LinearVelocityValid)
         );
         assert!(
-            (valid_again.linear_velocity_enu_m_s().x() - 1.0).abs() < 0.15,
+            (valid_again.twist().linear_velocity_enu_m_s().x() - 1.0).abs() < 0.15,
             "estimated velocity x = {}",
-            valid_again.linear_velocity_enu_m_s().x()
+            valid_again.twist().linear_velocity_enu_m_s().x()
         );
     }
 
@@ -3088,18 +3557,50 @@ mod tests {
 
         assert_eq!(config.zenoh.namespace, "qualisys");
         assert_eq!(
-            body_topic(&config.zenoh.namespace, "cub1", POSE_TOPIC_KEY),
+            body_topic(&config.zenoh.namespace, "cub1", raw_pose_topic_info().key),
+            "qualisys/cub1/pose_raw"
+        );
+        assert_eq!(
+            body_topic(&config.zenoh.namespace, "cub1", pose_topic_info().key),
             "qualisys/cub1/pose"
         );
         assert_eq!(
             body_topic(
                 &config.zenoh.namespace,
                 "cub1",
-                odometry_estimate_topic_info().key
+                pose_with_covariance_topic_info().key
             ),
+            "qualisys/cub1/pose_cov"
+        );
+        assert_eq!(
+            body_topic(&config.zenoh.namespace, "cub1", twist_topic_info().key),
+            "qualisys/cub1/twist"
+        );
+        assert_eq!(
+            body_topic(
+                &config.zenoh.namespace,
+                "cub1",
+                twist_with_covariance_topic_info().key
+            ),
+            "qualisys/cub1/twist_cov"
+        );
+        assert_eq!(
+            body_topic(&config.zenoh.namespace, "cub1", odometry_topic_info().key),
             "qualisys/cub1/odom"
         );
-        assert_eq!(body_topic("", "cub2", POSE_TOPIC_KEY), "cub2/pose");
+        assert_eq!(
+            body_topic(
+                &config.zenoh.namespace,
+                "cub1",
+                odometry_with_covariance_topic_info().key
+            ),
+            "qualisys/cub1/odom_cov"
+        );
+        assert_eq!(body_topic("", "cub2", pose_topic_info().key), "cub2/pose");
+        assert_eq!(
+            namespaced_topic(&config.zenoh.namespace, mocap_frame_topic_info().key),
+            "qualisys/mocap"
+        );
         assert_eq!(
             body_topic("field_lab/qualisys/", "cub2", "odom"),
             "field_lab/qualisys/cub2/odom"
@@ -3163,55 +3664,154 @@ mod tests {
     #[test]
     fn publisher_value_contracts_match_synapse_catalog() {
         assert_eq!(
+            BodyTopicKind::RawPose.encoding(),
+            format!(
+                "application/x-synapse-struct;type=synapse.topic.RawPoseData;schema=sha256-128:{}",
+                raw_pose_topic_info().schema_hash
+            )
+        );
+        assert_eq!(
             BodyTopicKind::Pose.encoding(),
             format!(
-                "application/x-synapse-struct;type=synapse.topic.ExternalOdometryData;schema=sha256-128:{}",
-                external_odometry_topic_info().schema_hash
+                "application/x-synapse-struct;type=synapse.topic.PoseData;schema=sha256-128:{}",
+                pose_topic_info().schema_hash
+            )
+        );
+        assert_eq!(
+            BodyTopicKind::PoseCov.encoding(),
+            format!(
+                "application/x-synapse-struct;type=synapse.topic.PoseWithCovarianceData;schema=sha256-128:{}",
+                pose_with_covariance_topic_info().schema_hash
+            )
+        );
+        assert_eq!(
+            BodyTopicKind::Twist.encoding(),
+            format!(
+                "application/x-synapse-struct;type=synapse.topic.TwistData;schema=sha256-128:{}",
+                twist_topic_info().schema_hash
+            )
+        );
+        assert_eq!(
+            BodyTopicKind::TwistCov.encoding(),
+            format!(
+                "application/x-synapse-struct;type=synapse.topic.TwistWithCovarianceData;schema=sha256-128:{}",
+                twist_with_covariance_topic_info().schema_hash
             )
         );
         assert_eq!(
             BodyTopicKind::Odom.encoding(),
             format!(
-                "application/x-synapse-struct;type=synapse.topic.OdometryEstimateData;schema=sha256-128:{}",
-                odometry_estimate_topic_info().schema_hash
+                "application/x-synapse-struct;type=synapse.topic.OdometryData;schema=sha256-128:{}",
+                odometry_topic_info().schema_hash
+            )
+        );
+        assert_eq!(
+            BodyTopicKind::OdomCov.encoding(),
+            format!(
+                "application/x-synapse-struct;type=synapse.topic.OdometryWithCovarianceData;schema=sha256-128:{}",
+                odometry_with_covariance_topic_info().schema_hash
+            )
+        );
+        assert_eq!(
+            value_contract::encoding_for_topic(mocap_frame_topic_info()),
+            format!(
+                "application/x-flatbuffers;type=synapse.topic.MocapPoseFrame;schema=sha256-128:{}",
+                mocap_frame_topic_info().schema_hash
             )
         );
     }
 
     #[test]
-    fn odometry_estimate_payload_carries_covariance_and_quality() {
+    fn raw_pose_payload_has_only_source_position_and_attitude() {
+        let body = test_observation(3, 1.0, 2.0, 3.0, qtm_quaternion(0.1, -0.2, 0.3, 0.9), true);
+        let payload = raw_pose_payload(&body, 750_000);
+        assert_eq!(payload.len(), raw_pose_topic_info().payload_size.unwrap());
+
+        let data = RawPoseData(payload.try_into().unwrap());
+        assert_eq!(data.timestamp_us(), 750_000);
+        assert_eq!(data.pose().position_enu_m().x(), 1.0);
+        assert_eq!(data.pose().position_enu_m().y(), 2.0);
+        assert_eq!(data.pose().position_enu_m().z(), 3.0);
+        assert_eq!(data.pose().attitude().w(), 0.9);
+        assert_eq!(data.pose().attitude().x(), 0.1);
+        assert_eq!(data.pose().attitude().y(), -0.2);
+        assert_eq!(data.pose().attitude().z(), 0.3);
+    }
+
+    #[test]
+    fn filtered_pose_covariance_uses_filter_marginal() {
+        let mut estimators =
+            ExternalOdometryEstimators::new(estimator_config(&StreamConfig::default()));
+        let body = test_observation(3, 1.0, 2.0, 3.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true);
+        let estimate = update_estimate(&body, 750_000, &mut estimators);
+        let payload = pose_with_covariance_payload(&estimate);
+        assert_eq!(
+            payload.len(),
+            pose_with_covariance_topic_info().payload_size.unwrap()
+        );
+
+        let data = PoseWithCovarianceData(payload.try_into().unwrap());
+        assert_eq!(data.timestamp_us(), 750_000);
+        assert_eq!(data.pose().position_enu_m().x(), 1.0);
+        assert!((data.covariance().c0() - 0.002_f32.powi(2)).abs() < 1.0e-12);
+        assert!((data.covariance().c15() - 0.01_f32.powi(2)).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn raw_mocap_rigid_body_uses_quaternion_attitude() {
+        let body = test_observation(4, 1.0, 2.0, 3.0, qtm_quaternion(0.1, -0.2, 0.3, 0.9), true);
+        let data = mocap_rigid_body_data(&body);
+
+        assert_eq!(data.id(), 4);
+        assert_eq!(data.pose().position_enu_m().x(), 1.0);
+        assert_eq!(data.pose().attitude().w(), 0.9);
+        assert_eq!(data.pose().attitude().x(), 0.1);
+        assert_eq!(data.pose().attitude().y(), -0.2);
+        assert_eq!(data.pose().attitude().z(), 0.3);
+        assert!(MocapRawFlags::from_bits_retain(data.flags()).contains(MocapRawFlags::Valid));
+    }
+
+    #[test]
+    fn odometry_covariance_payload_carries_full_tangent_covariance() {
         let mut estimators =
             ExternalOdometryEstimators::new(estimator_config(&StreamConfig::default()));
         let body = test_observation(3, 1.0, 2.0, 3.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true);
         let estimate = update_estimate(&body, 750_000, &mut estimators);
 
-        let payload = odometry_estimate_payload(&estimate);
+        let payload = odometry_with_covariance_payload(&estimate);
         assert_eq!(
             payload.len(),
-            odometry_estimate_topic_info()
+            odometry_with_covariance_topic_info()
                 .payload_size
                 .expect("catalog payload size"),
         );
 
-        let data = OdometryEstimateData(payload.try_into().unwrap());
+        let data = OdometryWithCovarianceData(payload.try_into().unwrap());
         assert_eq!(data.timestamp_us(), 750_000);
-        assert_eq!(data.position_enu_m().x(), 1.0);
-        assert_eq!(data.reset_counter(), 0);
-        assert_eq!(data.estimator_type(), ODOMETRY_ESTIMATOR_TYPE);
-        assert_eq!(data.quality_pct(), 100);
-        // pose covariance leads with the position variance from the
-        // configured measurement noise; the rotation block follows.
+        assert_eq!(data.pose().position_enu_m().x(), 1.0);
+        assert_eq!(data.status(), OdometryStatus::Filtered);
         let expected_position_variance = 0.002_f32.powi(2);
-        assert!((data.pose_covariance().c0() - expected_position_variance).abs() < 1.0e-12);
-        // Row-major upper triangle: element (3,3) — rotation-x variance — is
-        // c15 (rows of 6, 5, 4, then 3 elements).
+        assert!((data.covariance().c0() - expected_position_variance).abs() < 1.0e-12);
         let expected_attitude_variance = 0.01_f32.powi(2);
-        assert!((data.pose_covariance().c15() - expected_attitude_variance).abs() < 1.0e-9);
-        // velocity covariance leads with the initial linear-velocity
-        // variance and ends with the angular-velocity variance.
+        assert!((data.covariance().c33() - expected_attitude_variance).abs() < 1.0e-9);
         let expected_velocity_variance = 25.0_f32;
-        assert!((data.velocity_covariance().c0() - expected_velocity_variance).abs() < 1.0e-3);
-        assert!((data.velocity_covariance().c20() - expected_velocity_variance).abs() < 1.0e-3);
+        assert!((data.covariance().c57() - expected_velocity_variance).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn twist_covariance_payload_uses_twist_state_order() {
+        let mut estimators =
+            ExternalOdometryEstimators::new(estimator_config(&StreamConfig::default()));
+        let body = test_observation(3, 1.0, 2.0, 3.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true);
+        let estimate = update_estimate(&body, 750_000, &mut estimators);
+        let payload = twist_with_covariance_payload(&estimate);
+        let data = TwistWithCovarianceData(payload.try_into().unwrap());
+
+        assert_eq!(data.timestamp_us(), 750_000);
+        assert_eq!(data.twist().linear_velocity_enu_m_s().x(), 0.0);
+        let expected_velocity_variance = 25.0_f32;
+        assert!((data.covariance().c0() - expected_velocity_variance).abs() < 1.0e-3);
+        assert!((data.covariance().c15() - expected_velocity_variance).abs() < 1.0e-3);
     }
 
     #[test]
@@ -3232,22 +3832,48 @@ mod tests {
             &frame,
             &["one".to_owned(), "two".to_owned()],
             TopicPublicationStatus {
+                topic: "qualisys/two/pose_raw".to_owned(),
+                subscribed: false,
+            },
+            TopicPublicationStatus {
                 topic: "qualisys/two/pose".to_owned(),
+                subscribed: false,
+            },
+            TopicPublicationStatus {
+                topic: "qualisys/two/pose_cov".to_owned(),
+                subscribed: false,
+            },
+            TopicPublicationStatus {
+                topic: "qualisys/two/twist".to_owned(),
+                subscribed: false,
+            },
+            TopicPublicationStatus {
+                topic: "qualisys/two/twist_cov".to_owned(),
                 subscribed: false,
             },
             TopicPublicationStatus {
                 topic: "qualisys/two/odom".to_owned(),
                 subscribed: true,
             },
+            TopicPublicationStatus {
+                topic: "qualisys/two/odom_cov".to_owned(),
+                subscribed: false,
+            },
             &estimate,
         );
 
         assert_eq!(debug.id, 2);
         assert_eq!(debug.name, "two");
+        assert_eq!(debug.pose_raw.topic, "qualisys/two/pose_raw");
         assert_eq!(debug.pose.topic, "qualisys/two/pose");
         assert!(!debug.pose.subscribed);
+        assert_eq!(debug.pose_cov.topic, "qualisys/two/pose_cov");
+        assert_eq!(debug.twist.topic, "qualisys/two/twist");
+        assert_eq!(debug.twist_cov.topic, "qualisys/two/twist_cov");
         assert_eq!(debug.odom.topic, "qualisys/two/odom");
         assert!(debug.odom.subscribed);
+        assert_eq!(debug.odom_cov.topic, "qualisys/two/odom_cov");
+        assert!(!debug.odom_cov.subscribed);
         assert_eq!(debug.status, "Filtered");
         assert_eq!(debug.quality_pct, 100);
         assert_eq!(debug.drop_rate_2d_dpermille, 3);
@@ -3259,13 +3885,13 @@ mod tests {
         assert!((position_variance - 0.002_f64.powi(2)).abs() < 1.0e-12);
     }
 
-    fn encode_pose(
+    fn encode_odometry(
         body: &RigidBodyObservation,
         timestamp_us: u64,
         estimators: &mut ExternalOdometryEstimators,
     ) -> Vec<u8> {
         let estimate = update_estimate(body, timestamp_us, estimators);
-        external_odometry_payload(&estimate, body.id)
+        odometry_payload(&estimate)
     }
 
     fn test_observation(
