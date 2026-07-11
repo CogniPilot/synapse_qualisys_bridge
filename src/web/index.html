@@ -159,23 +159,12 @@
               </label>
               <label>
                 <span class="field-label">
-                  Frame topic
-                  <span class="help" tabindex="0" data-tip="Zenoh key expression for full synapse.topic.MocapFrame FlatBuffers." aria-label="Frame topic help"
+                  Namespace
+                  <span class="help" tabindex="0" data-tip="Namespace prepended to the per-rigid-body <namespace>/<body_name>/pose and <namespace>/<body_name>/odom key expressions." aria-label="Namespace help"
                     >?</span>
                 </span>
-                <input id="zenohTopic" name="zenohTopic" autocomplete="off" />
+                <input id="zenohNamespace" name="zenohNamespace" autocomplete="off" />
               </label>
-              <label>
-                <span class="field-label">
-                  External odometry prefix
-                  <span class="help" tabindex="0" data-tip="Optional namespace prepended to the per-rigid-body <body_name>/external_pose key expressions. Leave empty to publish in each body's own namespace." aria-label="External odometry prefix help"
-                    >?</span>
-                </span>
-                <input id="externalOdometryPrefix" name="externalOdometryPrefix" autocomplete="off" />
-              </label>
-              <div class="check-row">
-                <label><input type="checkbox" id="publishExternalOdometry" /> External odometry</label>
-              </div>
             </fieldset>
 
             <fieldset>
@@ -184,15 +173,10 @@
                 <span
                   class="help"
                   tabindex="0"
-                  data-tip="These checkboxes select QTM components requested continuously from Qualisys; Zenoh subscribers do not request them on demand."
+                  data-tip="The bridge continuously requests the QTM 6DOF rigid-body component; Zenoh subscribers do not request it on demand."
                   aria-label="QTM stream help"
                   >?</span>
               </legend>
-              <div class="check-row">
-                <label><input type="checkbox" name="include" value="rigid-bodies" /> Rigid bodies</label>
-                <label><input type="checkbox" name="include" value="labeled-markers" /> Labeled markers</label>
-                <label><input type="checkbox" name="include" value="unlabeled-markers" /> Unlabeled markers</label>
-              </div>
               <label>
                 <span class="field-label">
                   Transport
@@ -227,6 +211,14 @@
                     >?</span>
                 </span>
                 <input id="velocityMinDt" name="velocityMinDt" type="number" min="0" step="1" />
+              </label>
+              <label>
+                <span class="field-label">
+                  Degraded threshold ‱
+                  <span class="help" tabindex="0" data-tip="QTM 2D drop or out-of-sync rate (in 1/100 of a percent) at or above which odometry is marked Degraded. Trace rates below this are normal on real capture volumes. 0 disables the marking." aria-label="Degraded threshold help"
+                    >?</span>
+                </span>
+                <input id="degradedThreshold" name="degradedThreshold" type="number" min="0" step="1" />
               </label>
             </fieldset>
           </form>
@@ -279,7 +271,7 @@
             <span
               class="help"
               tabindex="0"
-              data-tip="Kalman filter estimate per rigid body. Click a body to inspect position, attitude, velocities, and covariance. Zenoh publishing starts when a subscriber matches the body's key expression."
+              data-tip="Kalman filter estimate per rigid body. Click a body to inspect position, attitude, velocities, and covariance. The pose and odom topics each publish once a subscriber matches their key expression."
               aria-label="External odometry help"
               >?</span>
           </h2>

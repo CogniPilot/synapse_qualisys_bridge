@@ -47,17 +47,29 @@ Useful defaults can also come from environment variables:
 QUALISYS_HOST=127.0.0.1 cargo run --bin synapse-qualisys-bridge
 ```
 
-Topic keys follow the synapse_fbs 0.6 topic catalog: raw mocap frames publish
-on `qualisys/mocap` by default, and per-rigid-body external odometry publishes
-on `<body_name>/external_pose` in each tracked vehicle's own namespace. Run
+The bridge publishes two topics per tracked rigid body, nested under the
+mocap system's namespace as the synapse_fbs 0.6 README recommends for
+infrastructure sources:
+
+```text
+qualisys/<body_name>/pose   # synapse.topic.ExternalOdometryData (64 bytes)
+qualisys/<body_name>/odom   # synapse.topic.OdometryEstimateData (232 bytes)
+```
+
+`pose` carries the pose/twist estimator input; `odom` carries the full
+Kalman filter estimate including the pose and velocity covariance blocks,
+reset counter, and quality percentage. The `pose` key is a deliberate
+deviation from the catalog's curated `external_pose` key; consumers identify
+payload types from the mandatory value contract, not the key. Run
 `cargo run --bin synapse-qualisys-bridge -- --help` for all options.
 
 Example subscriber configuration from another machine:
 
 ```text
 endpoint: udp/<bridge-pc-ip>:7447
-key expression: qualisys/mocap        # raw frames
-key expression: <body_name>/external_pose   # estimator input for one vehicle
+key expression: qualisys/<body_name>/pose   # estimator input for one vehicle
+key expression: qualisys/<body_name>/odom   # full estimate with covariance
+key expression: qualisys/**                 # everything from this bridge
 ```
 
 Every published Zenoh value carries the synapse_fbs 0.6 value contract
@@ -80,60 +92,23 @@ Run from a configuration file:
 synapse-qualisys-bridge --config bridge.toml --open
 ```
 
-By default, the bridge requests rigid-body pose from the QTM RT stream and
-publishes it continuously on Zenoh. Add high-rate QTM components explicitly
-when bandwidth allows:
-
-```sh
-cargo run --bin synapse-qualisys-bridge -- \
-  --qualisys-host 192.168.1.10 \
-  --include rigid-bodies,labeled-markers
-```
-
-Supported `--include` values are `rigid-bodies`, `labeled-markers`, and
-`unlabeled-markers`. These options select which components the bridge requests
-from Qualisys; Zenoh subscribers consume the already-published topics and do not
-request QTM components on demand.
-
-QTM reports mocap positions in millimeters. The bridge converts all Synapse
-positions to meters before publishing. The raw `synapse.topic.MocapFrame`
-FlatBuffer preserves source-like marker and 6D rigid-body samples for logging
-and tooling. Rigid-body samples are invalid only when the pose values are not
-finite. A nonzero QTM dropped or out-of-sync rate is retained as degraded
-quality, so a finite pose remains available for visualization while derived
-odometry reports `Degraded` rather than silently appearing lost.
-
-The bridge publishes a small JSON ID/name mapping at startup and every five
-seconds on `qualisys/rigid_body_names` (configurable with
-`zenoh.rigid_body_names_topic`). This lets visualizers select a body by its QTM
-name instead of assuming a numeric ID:
-
-```json
-{"source":"qualisys","rigidBodies":[{"id":1,"name":"cub1"}]}
-```
-
-The bridge also publishes fixed-layout per-rigid-body external odometry payloads
-by default:
-
-```text
-[<prefix>/]<body_name>/external_pose
-```
+The bridge continuously requests the QTM 6DOF rigid-body component. QTM
+reports mocap positions in millimeters; the bridge converts all Synapse
+positions to meters before publishing. Rigid-body samples are invalid only
+when the pose values are not finite.
 
 `<body_name>` is the QTM rigid-body name sanitized to a lowercase snake_case
 Zenoh key segment (`Cub 1` becomes `cub_1`), with a `body_<id>` fallback for
-empty or unusable names, matching the synapse_fbs convention that bridges
-write estimator inputs into the consuming vehicle's own namespace. Use
-`--external-odometry-topic-prefix` to prepend a deployment namespace (for
-example `field_lab`), or `--no-external-odometry` to disable these topics.
+empty or unusable names, so subscribers select a vehicle by name directly
+from the key. Use `--namespace` to change the leading namespace (for example
+`field_lab/qualisys`).
 
-Each payload is the 64-byte `synapse.topic.ExternalOdometryData` struct:
-timestamp, position in ENU meters, attitude as body-FLU to ENU quaternion,
-linear velocity in ENU meters per second, and angular velocity in body-FLU
-radians per second. The estimator runs for every tracked body so the
-dashboard's External Odometry panel can display the live Kalman filter state
-(position, attitude, velocities, and the full 12x12 covariance); the Zenoh
-publication stays demand-driven, only sending a body's payloads while Zenoh
-reports a matching subscriber for its key expression. The estimator is a 12D
+The estimator runs for every tracked body so the dashboard's External
+Odometry panel can display the live Kalman filter state (position, attitude,
+velocities, the full 12x12 covariance, reset counter, quality, and the raw
+QTM 2D drop and out-of-sync rates); each Zenoh publication stays
+demand-driven, only sending a body's `pose` or `odom` payloads while Zenoh
+reports a matching subscriber for that key expression. The estimator is a 12D
 Lie/error-state EKF prediction model generated from the
 `Estimation.Examples.MocapExternalOdometryIEKF` Modelica example in the pinned
 `third_party/modelica_models` submodule. It estimates position, attitude,
@@ -141,9 +116,11 @@ linear velocity, and angular velocity without a centered least-squares fit that
 would add lookahead latency. State resets across dropped, out-of-sync, invalid,
 or too-sparse samples.
 
-Configurations saved by bridge versions before the synapse_fbs 0.6 update keep
-working: the legacy `synapse/v1/topic/...` default key expressions are migrated
-to the catalog keys on startup, while custom key expressions are left as-is.
+QTM reports 2D drop and out-of-sync rates in 1/100 of a percent, and trace
+nonzero values are normal on real capture volumes. Odometry is marked
+`Degraded` only while either rate is at or above
+`stream.degraded_rate_threshold_dpermille` (default 100, i.e. 1%); set it to
+0 to disable the marking.
 
 Regenerate the estimator kernel after updating Rumoca or `modelica_models`:
 

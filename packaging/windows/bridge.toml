@@ -8,8 +8,8 @@ port = 22223
 timeout_ms = 5000
 
 [stream]
-include = ["rigid-bodies"]
 transport = "udp"
+degraded_rate_threshold_dpermille = 100
 udp_bind = "0.0.0.0:0"
 velocity_max_gap_ms = 100
 velocity_min_dt_ms = 1
@@ -20,10 +20,7 @@ attitude_stddev_rad = 0.01
 mode = "router"
 connect = ""
 listen = "udp/0.0.0.0:7447,tcp/0.0.0.0:7447"
-topic = "qualisys/mocap"
-external_odometry_topic_prefix = ""
-rigid_body_names_topic = "qualisys/rigid_body_names"
-no_external_odometry = false
+namespace = "qualisys"
 admin_query_timeout_ms = 1000
 
 [web]

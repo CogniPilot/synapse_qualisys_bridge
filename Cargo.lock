@@ -2651,7 +2651,6 @@ name = "synapse_qualisys_bridge"
 version = "0.4.0"
 dependencies = [
  "clap",
- "flatbuffers",
  "qualisys_rust_sdk",
  "semver",
  "serde",

@@ -80,6 +80,9 @@ pub struct ExternalOdometryEstimate {
     pub status: ExternalOdometryStatus,
     pub flags: ExternalOdometryFlags,
     pub covariance: CovarianceMatrix,
+    /// Wraps when the filter re-initializes or jumps the state after the
+    /// first acquisition.
+    pub reset_counter: u8,
 }
 
 impl ExternalOdometryEstimate {
@@ -93,6 +96,7 @@ impl ExternalOdometryEstimate {
             status: ExternalOdometryStatus::Lost,
             flags: ExternalOdometryFlags::Lost,
             covariance: zero_matrix12(),
+            reset_counter: 0,
         }
     }
 }
@@ -134,6 +138,7 @@ struct MocapExternalOdometryEstimator {
     last_mocap_timestamp_us: u64,
     frames_since_last_mocap_count: u8,
     twist_valid: bool,
+    reset_counter: u8,
 }
 
 impl MocapExternalOdometryEstimator {
@@ -160,6 +165,7 @@ impl MocapExternalOdometryEstimator {
             last_mocap_timestamp_us: 0,
             frames_since_last_mocap_count: 0,
             twist_valid: false,
+            reset_counter: 0,
         }
     }
 
@@ -278,6 +284,9 @@ impl MocapExternalOdometryEstimator {
     }
 
     fn initialize(&mut self, measurement: MocapMeasurement) {
+        if self.initialized {
+            self.reset_counter = self.reset_counter.wrapping_add(1);
+        }
         self.y.fill(0.0);
         self.y[ATTITUDE_OFFSET..ATTITUDE_OFFSET + 4]
             .copy_from_slice(&normalized_quat(measurement.attitude_wxyz));
@@ -455,6 +464,7 @@ impl MocapExternalOdometryEstimator {
             status,
             flags,
             covariance: self.covariance(),
+            reset_counter: self.reset_counter,
         }
     }
 

@@ -274,28 +274,37 @@ function covarianceGroup(key, covariance) {
   return collapsible(key, [summary], [wrap]);
 }
 
+function topicBadge(label, publication) {
+  const badge = document.createElement("span");
+  badge.className = "odom-badge";
+  badge.textContent = `${label}: ${publication?.subscribed ? "publishing" : "idle"}`;
+  return badge;
+}
+
 function odometryNode(body) {
   const name = document.createElement("strong");
   name.textContent = `${body.name} (id ${body.id})`;
   const status = document.createElement("span");
   status.className = `odom-status ${odometryStatusClass(body.status)}`;
   status.textContent = body.status;
-  const badge = document.createElement("span");
-  badge.className = "odom-badge";
-  badge.textContent = body.subscribed ? "publishing" : "no subscriber";
+  const poseBadge = topicBadge("pose", body.pose);
+  const odomBadge = topicBadge("odom", body.odom);
   const topic = document.createElement("code");
-  topic.textContent = body.topic;
+  topic.textContent = `${body.pose?.topic || ""} · ${body.odom?.topic || ""}`;
 
   const meta = document.createElement("p");
   meta.className = "odom-meta";
   const flags = (body.flags || []).join(", ") || "none";
-  meta.textContent = `t = ${fmtInt(body.timestamp_us)} µs · flags: ${flags}`;
+  meta.textContent =
+    `t = ${fmtInt(body.timestamp_us)} µs · flags: ${flags} · quality ${body.quality_pct}%` +
+    ` · resets ${fmtInt(body.reset_counter)}` +
+    ` · QTM 2D drop ${fmtInt(body.drop_rate_2d_dpermille)}‱, out-of-sync ${fmtInt(body.out_of_sync_rate_2d_dpermille)}‱`;
 
   const key = `odom:${body.id}`;
   const covariance = body.covariance || [];
   return collapsible(
     key,
-    [name, status, badge, topic],
+    [name, status, poseBadge, odomBadge, topic],
     [
       meta,
       vectorGroup(`${key}:pos`, "Position (ENU m)", body.position_enu_m, covariance, COV_POSITION),
@@ -387,17 +396,12 @@ async function loadConfig() {
   $("zenohMode").value = cfg.zenoh.mode;
   $("zenohListen").value = cfg.zenoh.listen;
   $("zenohConnect").value = cfg.zenoh.connect;
-  $("zenohTopic").value = cfg.zenoh.topic;
-  $("externalOdometryPrefix").value = cfg.zenoh.external_odometry_topic_prefix;
-  $("publishExternalOdometry").checked = !cfg.zenoh.no_external_odometry;
+  $("zenohNamespace").value = cfg.zenoh.namespace;
   $("transport").value = cfg.stream.transport;
   $("udpBind").value = cfg.stream.udp_bind;
   $("velocityMaxGap").value = cfg.stream.velocity_max_gap_ms;
   $("velocityMinDt").value = cfg.stream.velocity_min_dt_ms;
-
-  for (const checkbox of document.querySelectorAll("input[name='include']")) {
-    checkbox.checked = cfg.stream.include.includes(checkbox.value);
-  }
+  $("degradedThreshold").value = cfg.stream.degraded_rate_threshold_dpermille;
 }
 
 function readConfigForm() {
@@ -408,19 +412,12 @@ function readConfigForm() {
   cfg.zenoh.mode = $("zenohMode").value;
   cfg.zenoh.listen = $("zenohListen").value.trim();
   cfg.zenoh.connect = $("zenohConnect").value.trim();
-  cfg.zenoh.topic = $("zenohTopic").value.trim();
-  cfg.zenoh.external_odometry_topic_prefix = $("externalOdometryPrefix").value.trim();
-  cfg.zenoh.no_external_odometry = !$("publishExternalOdometry").checked;
+  cfg.zenoh.namespace = $("zenohNamespace").value.trim();
   cfg.stream.transport = $("transport").value;
   cfg.stream.udp_bind = $("udpBind").value.trim();
   cfg.stream.velocity_max_gap_ms = Number($("velocityMaxGap").value);
   cfg.stream.velocity_min_dt_ms = Number($("velocityMinDt").value);
-  cfg.stream.include = Array.from(document.querySelectorAll("input[name='include']:checked")).map(
-    (checkbox) => checkbox.value,
-  );
-  if (!cfg.stream.include.length) {
-    cfg.stream.include = ["rigid-bodies"];
-  }
+  cfg.stream.degraded_rate_threshold_dpermille = Number($("degradedThreshold").value);
   return cfg;
 }
 

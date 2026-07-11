@@ -20,7 +20,6 @@ use estimator::{
     CovarianceMatrix, ExternalOdometryEstimate, ExternalOdometryEstimators,
     MocapExternalOdometryEstimatorConfig, MocapMeasurement,
 };
-use flatbuffers::FlatBufferBuilder;
 use qualisys_rust_sdk::rt::{
     AssembledFrame, Client, ClientOptions, ComponentData, ComponentSelection, ComponentType,
     FrameAccumulator, MocapParameters, StreamFramesRequest, StreamPacket, StreamRate,
@@ -28,11 +27,8 @@ use qualisys_rust_sdk::rt::{
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use synapse_fbs::synapse::types::{Quaternionf, RateTriplet, RotationMatrix3f, Vec3f};
-use synapse_fbs::topic::{
-    ExternalOdometryData, ExternalOdometryFlags, MocapFrame, MocapFrameArgs, MocapMarkerData,
-    MocapRawComponent, MocapRawFlags, MocapRigidBodyData,
-};
+use synapse_fbs::synapse::types::{CovarianceUpperTriangle21f, Quaternionf, RateTriplet, Vec3f};
+use synapse_fbs::topic::{ExternalOdometryData, ExternalOdometryFlags, OdometryEstimateData};
 use synapse_fbs::topic_catalog::{self, TopicInfo};
 use synapse_fbs::value_contract;
 use thiserror::Error;
@@ -55,8 +51,9 @@ const QTM_MILLIMETERS_TO_METERS: f32 = 0.001;
     name = BIN_NAME,
     version,
     about = "Bridge Qualisys QTM RT mocap data to Synapse FlatBuffers on Zenoh",
-    long_about = "Runs a controllable local web interface, listens to a Qualisys QTM RT stream, \
-converts selected mocap components into synapse.topic.MocapFrame FlatBuffers, and publishes them on Zenoh.",
+    long_about = "Runs a controllable local web interface, listens to a Qualisys QTM RT rigid-body \
+stream, and publishes per-body synapse.topic.ExternalOdometryData and \
+synapse.topic.OdometryEstimateData payloads on Zenoh under the mocap system's namespace.",
     next_line_help = true,
     after_help = "\
 Examples:
@@ -67,9 +64,7 @@ Examples:
 Environment:
   SYNAPSE_QUALISYS_BRIDGE_CONFIG
   QUALISYS_HOST, QUALISYS_PORT, QUALISYS_TIMEOUT_MS
-  ZENOH_MODE, ZENOH_CONNECT, ZENOH_LISTEN
-  ZENOH_TOPIC, ZENOH_EXTERNAL_ODOMETRY_TOPIC_PREFIX, ZENOH_RIGID_BODY_NAMES_TOPIC, ZENOH_NO_EXTERNAL_ODOMETRY
-  MOCAP_INCLUDE"
+  ZENOH_MODE, ZENOH_CONNECT, ZENOH_LISTEN, ZENOH_NAMESPACE"
 )]
 struct Cli {
     #[arg(
@@ -131,16 +126,6 @@ struct QualisysArgs {
 #[derive(Debug, Parser)]
 #[command(next_help_heading = "QTM Stream")]
 struct StreamArgs {
-    #[arg(
-        long = "include",
-        env = "MOCAP_INCLUDE",
-        value_enum,
-        value_delimiter = ',',
-        value_name = "DATA",
-        help = "High-rate data to include. Repeat or comma-separate. Default: rigid-bodies"
-    )]
-    include: Vec<MocapData>,
-
     #[arg(long, value_enum, help = "Transport used for QTM streamframes")]
     transport: Option<StreamTransportArg>,
 
@@ -167,6 +152,15 @@ struct StreamArgs {
     velocity_max_gap_ms: Option<u64>,
 
     #[arg(
+        long = "degraded-rate-threshold-dpermille",
+        env = "DEGRADED_RATE_THRESHOLD_DPERMILLE",
+        value_name = "DPERMILLE",
+        help = "QTM 2D drop/out-of-sync rate (1/100 of a percent) at or above \
+                which samples are marked Degraded; 0 disables the marking"
+    )]
+    degraded_rate_threshold_dpermille: Option<u16>,
+
+    #[arg(
         long = "velocity-min-dt-ms",
         env = "VELOCITY_MIN_DT_MS",
         value_name = "MS",
@@ -180,14 +174,6 @@ struct StreamArgs {
 enum StreamTransportArg {
     Udp,
     Tcp,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum MocapData {
-    RigidBodies,
-    LabeledMarkers,
-    UnlabeledMarkers,
 }
 
 #[derive(Debug, Parser)]
@@ -219,40 +205,13 @@ struct ZenohArgs {
     zenoh_listen: Option<String>,
 
     #[arg(
-        long = "topic",
-        alias = "zenoh-topic",
-        env = "ZENOH_TOPIC",
-        value_name = "KEYEXPR",
-        help = "Zenoh key expression for synapse.topic.MocapFrame payloads"
-    )]
-    topic: Option<String>,
-
-    #[arg(
-        long = "external-odometry-topic-prefix",
-        alias = "rigid-body-pose-topic-prefix",
-        env = "ZENOH_EXTERNAL_ODOMETRY_TOPIC_PREFIX",
+        long = "namespace",
+        env = "ZENOH_NAMESPACE",
         value_name = "NAMESPACE",
-        help = "Optional namespace prepended to per-rigid-body \
-                [<prefix>/]<body_name>/external_pose key expressions"
+        help = "Namespace prepended to the per-rigid-body \
+                <namespace>/<body_name>/{pose,odom} key expressions"
     )]
-    external_odometry_topic_prefix: Option<String>,
-
-    #[arg(
-        long = "rigid-body-names-topic",
-        env = "ZENOH_RIGID_BODY_NAMES_TOPIC",
-        value_name = "KEYEXPR",
-        help = "Zenoh key expression for JSON rigid-body ID/name metadata"
-    )]
-    rigid_body_names_topic: Option<String>,
-
-    #[arg(
-        long = "no-external-odometry",
-        alias = "no-rigid-body-pose-topics",
-        env = "ZENOH_NO_EXTERNAL_ODOMETRY",
-        action = ArgAction::SetTrue,
-        help = "Disable per-rigid-body ExternalOdometry publishing"
-    )]
-    no_external_odometry: bool,
+    namespace: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -350,8 +309,8 @@ impl Default for QualisysConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct StreamConfig {
-    include: Vec<MocapData>,
     transport: StreamTransportArg,
+    degraded_rate_threshold_dpermille: u16,
     udp_bind: SocketAddr,
     udp_destination: Option<IpAddr>,
     velocity_max_gap_ms: u64,
@@ -363,8 +322,8 @@ struct StreamConfig {
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
-            include: vec![MocapData::RigidBodies],
             transport: StreamTransportArg::Udp,
+            degraded_rate_threshold_dpermille: 100,
             udp_bind: "0.0.0.0:0".parse().expect("valid default UDP bind"),
             udp_destination: None,
             velocity_max_gap_ms: 100,
@@ -381,10 +340,7 @@ struct ZenohConfig {
     mode: ZenohMode,
     connect: String,
     listen: String,
-    topic: String,
-    external_odometry_topic_prefix: String,
-    rigid_body_names_topic: String,
-    no_external_odometry: bool,
+    namespace: String,
     admin_query_timeout_ms: u64,
 }
 
@@ -394,34 +350,27 @@ impl Default for ZenohConfig {
             mode: ZenohMode::Router,
             connect: String::new(),
             listen: "udp/0.0.0.0:7447,tcp/0.0.0.0:7447".to_owned(),
-            topic: default_mocap_topic(),
-            external_odometry_topic_prefix: String::new(),
-            rigid_body_names_topic: default_rigid_body_names_topic(),
-            no_external_odometry: false,
+            namespace: default_namespace(),
             admin_query_timeout_ms: 1_000,
         }
     }
 }
 
-/// The synapse_fbs 0.6 catalog key for raw mocap frames, published under the
-/// mocap system's own `qualisys` namespace per the synapse_fbs README.
-fn default_mocap_topic() -> String {
-    format!("qualisys/{}", mocap_frame_topic_info().key)
-}
-
-/// The JSON id/name mapping is bridge-specific (not a catalog topic) but
-/// still publishes under the mocap system's `qualisys` namespace.
-fn default_rigid_body_names_topic() -> String {
-    "qualisys/rigid_body_names".to_owned()
-}
-
-fn mocap_frame_topic_info() -> &'static TopicInfo {
-    topic_catalog::topic_by_name("MocapFrame").expect("MocapFrame in synapse_fbs topic catalog")
+/// Per the synapse_fbs README, an infrastructure source owns its own
+/// namespace; per-tracked-vehicle outputs nest a vehicle sub-namespace
+/// (`qualisys/cub1/external_pose`, `qualisys/cub1/odom`).
+fn default_namespace() -> String {
+    "qualisys".to_owned()
 }
 
 fn external_odometry_topic_info() -> &'static TopicInfo {
     topic_catalog::topic_by_name("ExternalOdometry")
         .expect("ExternalOdometry in synapse_fbs topic catalog")
+}
+
+fn odometry_estimate_topic_info() -> &'static TopicInfo {
+    topic_catalog::topic_by_name("OdometryEstimate")
+        .expect("OdometryEstimate in synapse_fbs topic catalog")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -961,9 +910,7 @@ struct ZenohAccess {
     connect: String,
     subscriber_endpoint: Option<String>,
     subscriber_endpoints: Vec<String>,
-    frame_topic: String,
-    external_odometry_topic_prefix: String,
-    rigid_body_names_topic: String,
+    namespace: String,
     sample_key_expr: String,
     example_subscriber_args: Option<String>,
 }
@@ -1015,16 +962,27 @@ struct RigidBodyStatus {
 struct OdometryDebugStatus {
     id: i32,
     name: String,
-    topic: String,
-    subscribed: bool,
+    pose: TopicPublicationStatus,
+    odom: TopicPublicationStatus,
     timestamp_us: u64,
     status: String,
     flags: Vec<String>,
+    quality_degraded: bool,
+    drop_rate_2d_dpermille: u16,
+    out_of_sync_rate_2d_dpermille: u16,
+    reset_counter: u8,
+    quality_pct: i8,
     position_enu_m: [f32; 3],
     attitude_wxyz: [f32; 4],
     linear_velocity_enu_m_s: [f32; 3],
     angular_velocity_flu_rad_s: [f32; 3],
     covariance: CovarianceMatrix,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TopicPublicationStatus {
+    topic: String,
+    subscribed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1155,12 +1113,6 @@ fn main() -> Result<()> {
 
     let config_path = resolve_config_path(cli.config.as_deref());
     let mut config = load_config_or_default(&config_path)?;
-    // Persist migrated topics before CLI overrides so one-shot flags such as
-    // --open never leak into the saved configuration.
-    let migrated_topics = migrate_legacy_topics(&mut config);
-    if migrated_topics {
-        save_config(&config_path, &config)?;
-    }
     apply_cli_overrides(&mut config, &cli);
     ensure_config_file(&config_path, &config)?;
 
@@ -1173,17 +1125,6 @@ fn main() -> Result<()> {
         "info",
         format!("Using configuration {}", app.0.config_path.display()),
     );
-    if migrated_topics {
-        app.log(
-            "info",
-            format!(
-                "Migrated legacy synapse/v1 topic defaults to the synapse_fbs 0.6 keys \
-                 ({} and [<prefix>/]<body_name>/{})",
-                app.config().zenoh.topic,
-                external_odometry_topic_info().key
-            ),
-        );
-    }
 
     if !config.web.enabled {
         app.log(
@@ -1435,29 +1376,6 @@ fn spawn_close_listener(app: &AppHandle) {
     });
 }
 
-/// Rewrite the pre-0.6 default key expressions from saved configurations to
-/// the synapse_fbs 0.6 catalog defaults. Custom values are left untouched.
-fn migrate_legacy_topics(config: &mut AppConfig) -> bool {
-    const LEGACY_MOCAP_TOPIC: &str = "synapse/v1/topic/mocap_frame";
-    const LEGACY_EXTERNAL_ODOMETRY_PREFIX: &str = "synapse/v1/topic/external_odometry";
-    const LEGACY_RIGID_BODY_NAMES_TOPIC: &str = "synapse/mocap/rigid_body_names";
-
-    let mut migrated = false;
-    if config.zenoh.topic == LEGACY_MOCAP_TOPIC {
-        config.zenoh.topic = default_mocap_topic();
-        migrated = true;
-    }
-    if config.zenoh.external_odometry_topic_prefix == LEGACY_EXTERNAL_ODOMETRY_PREFIX {
-        config.zenoh.external_odometry_topic_prefix = String::new();
-        migrated = true;
-    }
-    if config.zenoh.rigid_body_names_topic == LEGACY_RIGID_BODY_NAMES_TOPIC {
-        config.zenoh.rigid_body_names_topic = default_rigid_body_names_topic();
-        migrated = true;
-    }
-    migrated
-}
-
 fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
     if let Some(host) = cli.qualisys.qualisys_host.as_ref() {
         config.qualisys.host = host.clone();
@@ -1467,9 +1385,6 @@ fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
     }
     if let Some(timeout_ms) = cli.qualisys.timeout_ms {
         config.qualisys.timeout_ms = timeout_ms;
-    }
-    if !cli.stream.include.is_empty() {
-        config.stream.include = cli.stream.include.clone();
     }
     if let Some(transport) = cli.stream.transport {
         config.stream.transport = transport;
@@ -1486,6 +1401,9 @@ fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
     if let Some(value) = cli.stream.velocity_min_dt_ms {
         config.stream.velocity_min_dt_ms = value;
     }
+    if let Some(value) = cli.stream.degraded_rate_threshold_dpermille {
+        config.stream.degraded_rate_threshold_dpermille = value;
+    }
     if let Some(mode) = cli.zenoh.zenoh_mode {
         config.zenoh.mode = mode;
     }
@@ -1495,17 +1413,8 @@ fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
     if let Some(listen) = cli.zenoh.zenoh_listen.as_ref() {
         config.zenoh.listen = listen.clone();
     }
-    if let Some(topic) = cli.zenoh.topic.as_ref() {
-        config.zenoh.topic = topic.clone();
-    }
-    if let Some(prefix) = cli.zenoh.external_odometry_topic_prefix.as_ref() {
-        config.zenoh.external_odometry_topic_prefix = prefix.clone();
-    }
-    if let Some(topic) = cli.zenoh.rigid_body_names_topic.as_ref() {
-        config.zenoh.rigid_body_names_topic = topic.clone();
-    }
-    if cli.zenoh.no_external_odometry {
-        config.zenoh.no_external_odometry = true;
+    if let Some(namespace) = cli.zenoh.namespace.as_ref() {
+        config.zenoh.namespace = namespace.clone();
     }
     if let Some(bind) = cli.web.web_bind {
         config.web.bind = bind;
@@ -1573,16 +1482,6 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
     app.set_bridge_status("starting", "Opening Zenoh session", None);
     let session = app.ensure_zenoh_session()?;
 
-    let publisher = session
-        .declare_publisher(config.zenoh.topic.clone())
-        .encoding(value_contract::encoding_for_topic(mocap_frame_topic_info()))
-        .wait()
-        .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
-    let rigid_body_names_publisher = session
-        .declare_publisher(config.zenoh.rigid_body_names_topic.clone())
-        .wait()
-        .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
-
     app.set_qualisys_status(
         "connecting",
         format!(
@@ -1601,22 +1500,10 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
         None,
     );
 
-    let selection = selected_data(config);
     let parameters = client.get_mocap_parameters()?;
     let rigid_body_names = rigid_body_names(&parameters);
-    let rigid_body_names_payload = encode_rigid_body_names(&rigid_body_names)?;
-    rigid_body_names_publisher
-        .put(rigid_body_names_payload.clone())
-        .wait()
-        .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
-    app.record_topic(
-        config.zenoh.rigid_body_names_topic.clone(),
-        "rigid body name metadata publisher",
-        rigid_body_names_payload.len(),
-    );
-    let mut next_rigid_body_names_publish = Instant::now() + Duration::from_secs(5);
 
-    let components = stream_components(&selection);
+    let components = vec![ComponentSelection::SixDResidual];
     let request = StreamFramesRequest::new(
         StreamRate::AllFrames,
         stream_transport(config),
@@ -1627,68 +1514,38 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
     app.log(
         "info",
         format!(
-            "Bridge running: QTM {}:{}, {}, topic {}",
+            "Bridge running: QTM {}:{}, {}, namespace {}",
             config.qualisys.host,
             config.qualisys.port,
             zenoh_status_detail(config),
-            config.zenoh.topic
+            config.zenoh.namespace
         ),
     );
 
     let mut accumulator = FrameAccumulator::for_components(components);
     let mut odometry_estimators = ExternalOdometryEstimators::new(estimator_config(&config.stream));
     let mut odometry_publishers =
-        ExternalOdometryPublishers::new(external_odometry_namespaces(&rigid_body_names));
+        BodyOdometryPublishers::new(external_odometry_namespaces(&rigid_body_names));
     while !stop.load(Ordering::SeqCst) {
-        if Instant::now() >= next_rigid_body_names_publish {
-            rigid_body_names_publisher
-                .put(rigid_body_names_payload.clone())
-                .wait()
-                .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
-            app.record_topic(
-                config.zenoh.rigid_body_names_topic.clone(),
-                "rigid body name metadata publisher",
-                rigid_body_names_payload.len(),
-            );
-            next_rigid_body_names_publish = Instant::now() + Duration::from_secs(5);
-        }
         match client.recv_stream_packet()? {
             StreamPacket::Data(packet) => {
                 for frame in accumulator.push(packet) {
-                    let rigid_body_frame = if selection.contains(&MocapData::RigidBodies) {
-                        Some(rigid_body_frame(&frame)?)
-                    } else {
-                        None
-                    };
-                    let payload =
-                        encode_mocap_frame(&frame, &selection, rigid_body_frame.as_ref())?;
-                    let payload_len = payload.len();
-                    publisher
-                        .put(payload)
-                        .wait()
-                        .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
-                    app.record_topic(
-                        config.zenoh.topic.clone(),
-                        "mocap frame publisher",
-                        payload_len,
-                    );
+                    let rigid_body_frame =
+                        rigid_body_frame(&frame, config.stream.degraded_rate_threshold_dpermille)?;
 
-                    let odometry = publish_external_odometry(
+                    let odometry = publish_body_odometry(
                         &session,
                         config,
-                        rigid_body_frame.as_ref(),
+                        &rigid_body_frame,
                         &rigid_body_names,
                         &mut odometry_estimators,
                         &mut odometry_publishers,
                     )?;
                     for (topic, payload_len) in odometry.published {
-                        app.record_topic(topic, "external odometry publisher", payload_len);
+                        app.record_topic(topic, "odometry publisher", payload_len);
                     }
 
-                    let body_statuses = rigid_body_frame
-                        .as_ref()
-                        .map(|body_frame| rigid_body_statuses(body_frame, &rigid_body_names))
-                        .unwrap_or_default();
+                    let body_statuses = rigid_body_statuses(&rigid_body_frame, &rigid_body_names);
                     app.record_frame(
                         frame.frame_number,
                         frame.timestamp,
@@ -1765,9 +1622,7 @@ fn zenoh_access(config: &AppConfig) -> ZenohAccess {
         connect: config.zenoh.connect.clone(),
         subscriber_endpoint,
         subscriber_endpoints,
-        frame_topic: config.zenoh.topic.clone(),
-        external_odometry_topic_prefix: config.zenoh.external_odometry_topic_prefix.clone(),
-        rigid_body_names_topic: config.zenoh.rigid_body_names_topic.clone(),
+        namespace: config.zenoh.namespace.clone(),
         sample_key_expr,
         example_subscriber_args,
     }
@@ -1798,56 +1653,12 @@ fn local_network_ip() -> Option<IpAddr> {
 }
 
 fn subscription_key_expr(config: &AppConfig) -> String {
-    // Odometry keys live under per-body vehicle namespaces
-    // ([<prefix>/]<body_name>/external_pose), so with an empty prefix no
-    // expression narrower than `**` covers them.
-    let odometry_prefix = config
-        .zenoh
-        .external_odometry_topic_prefix
-        .trim_matches('/');
-    if !config.zenoh.no_external_odometry && odometry_prefix.is_empty() {
-        return "**".to_owned();
-    }
-
-    let mut topics = vec![
-        config.zenoh.topic.as_str(),
-        config.zenoh.rigid_body_names_topic.as_str(),
-    ];
-    if !config.zenoh.no_external_odometry {
-        topics.push(odometry_prefix);
-    }
-    let parts: Vec<Vec<&str>> = topics
-        .iter()
-        .map(|topic| {
-            topic
-                .trim_matches('/')
-                .split('/')
-                .filter(|segment| !segment.is_empty())
-                .collect()
-        })
-        .filter(|parts: &Vec<&str>| !parts.is_empty())
-        .collect();
-
-    let Some(first) = parts.first() else {
-        return "**".to_owned();
-    };
-
-    let mut shared = Vec::new();
-    for (index, part) in first.iter().enumerate() {
-        if parts
-            .iter()
-            .all(|candidate| candidate.get(index).is_some_and(|value| value == part))
-        {
-            shared.push(*part);
-        } else {
-            break;
-        }
-    }
-
-    if shared.is_empty() {
+    // Every publication lives under <namespace>/<body_name>/<key>.
+    let namespace = config.zenoh.namespace.trim_matches('/');
+    if namespace.is_empty() {
         "**".to_owned()
     } else {
-        format!("{}/**", shared.join("/"))
+        format!("{namespace}/**")
     }
 }
 
@@ -1898,28 +1709,6 @@ fn stream_transport(config: &AppConfig) -> StreamTransport {
     }
 }
 
-fn selected_data(config: &AppConfig) -> BTreeSet<MocapData> {
-    if config.stream.include.is_empty() {
-        return BTreeSet::from([MocapData::RigidBodies]);
-    }
-
-    config.stream.include.iter().copied().collect()
-}
-
-fn stream_components(selection: &BTreeSet<MocapData>) -> Vec<ComponentSelection> {
-    let mut components = Vec::new();
-    if selection.contains(&MocapData::RigidBodies) {
-        components.push(ComponentSelection::SixDResidual);
-    }
-    if selection.contains(&MocapData::LabeledMarkers) {
-        components.push(ComponentSelection::ThreeDResidual);
-    }
-    if selection.contains(&MocapData::UnlabeledMarkers) {
-        components.push(ComponentSelection::ThreeDNoLabelsResidual);
-    }
-    components
-}
-
 fn rigid_body_names(parameters: &MocapParameters) -> Vec<String> {
     parameters
         .six_d
@@ -1934,21 +1723,9 @@ fn rigid_body_names(parameters: &MocapParameters) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn encode_rigid_body_names(names: &[String]) -> Result<Vec<u8>> {
-    serde_json::to_vec(&serde_json::json!({
-        "source": "qualisys",
-        "rigidBodies": names.iter().enumerate().map(|(index, name)| serde_json::json!({
-            "id": index + 1,
-            "name": name,
-        })).collect::<Vec<_>>(),
-    }))
-    .map_err(|error| BridgeError::Config(error.to_string()))
-}
-
 #[derive(Debug, Clone)]
 struct RigidBodyFrame {
     timestamp_us: u64,
-    frame_number: u32,
     drop_rate_2d_dpermille: u16,
     out_of_sync_rate_2d_dpermille: u16,
     bodies: Vec<RigidBodyObservation>,
@@ -1959,7 +1736,6 @@ struct RigidBodyObservation {
     id: i32,
     position_enu_m: Vec3f,
     attitude: Quaternionf,
-    rotation: RotationMatrix3f,
     residual_mm: f32,
     tracking_valid: bool,
     quality_degraded: bool,
@@ -1975,13 +1751,45 @@ fn estimator_config(config: &StreamConfig) -> MocapExternalOdometryEstimatorConf
     }
 }
 
+/// Deployment key for the per-body pose/twist measurement. `pose` is a
+/// deliberate deviation from the catalog's curated `external_pose` key; the
+/// payload stays `synapse.topic.ExternalOdometryData` and the mandatory
+/// value-contract encoding identifies it on the wire.
+const POSE_TOPIC_KEY: &str = "pose";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BodyTopicKind {
+    Pose,
+    Odom,
+}
+
+impl BodyTopicKind {
+    fn key(self) -> &'static str {
+        match self {
+            BodyTopicKind::Pose => POSE_TOPIC_KEY,
+            BodyTopicKind::Odom => odometry_estimate_topic_info().key,
+        }
+    }
+
+    fn encoding(self) -> String {
+        match self {
+            BodyTopicKind::Pose => {
+                value_contract::encoding_for_topic(external_odometry_topic_info())
+            }
+            BodyTopicKind::Odom => {
+                value_contract::encoding_for_topic(odometry_estimate_topic_info())
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
-struct ExternalOdometryPublishers {
-    publishers: BTreeMap<i32, Publisher<'static>>,
+struct BodyOdometryPublishers {
+    publishers: BTreeMap<(i32, BodyTopicKind), Publisher<'static>>,
     namespaces: BTreeMap<i32, String>,
 }
 
-impl ExternalOdometryPublishers {
+impl BodyOdometryPublishers {
     fn new(namespaces: BTreeMap<i32, String>) -> Self {
         Self {
             publishers: BTreeMap::new(),
@@ -1989,13 +1797,13 @@ impl ExternalOdometryPublishers {
         }
     }
 
-    fn topic(&self, config: &AppConfig, body_id: i32) -> String {
-        let namespace = self
+    fn topic(&self, config: &AppConfig, body_id: i32, kind: BodyTopicKind) -> String {
+        let body_namespace = self
             .namespaces
             .get(&body_id)
             .cloned()
             .unwrap_or_else(|| format!("body_{}", body_id.max(0)));
-        external_odometry_topic(&config.zenoh.external_odometry_topic_prefix, &namespace)
+        body_topic(&config.zenoh.namespace, &body_namespace, kind.key())
     }
 
     fn publisher(
@@ -2003,21 +1811,20 @@ impl ExternalOdometryPublishers {
         session: &zenoh::Session,
         config: &AppConfig,
         body_id: i32,
+        kind: BodyTopicKind,
     ) -> Result<&Publisher<'static>> {
-        if !self.publishers.contains_key(&body_id) {
+        if !self.publishers.contains_key(&(body_id, kind)) {
             let publisher = session
-                .declare_publisher(self.topic(config, body_id))
-                .encoding(value_contract::encoding_for_topic(
-                    external_odometry_topic_info(),
-                ))
+                .declare_publisher(self.topic(config, body_id, kind))
+                .encoding(kind.encoding())
                 .wait()
                 .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
-            self.publishers.insert(body_id, publisher);
+            self.publishers.insert((body_id, kind), publisher);
         }
 
         Ok(self
             .publishers
-            .get(&body_id)
+            .get(&(body_id, kind))
             .expect("publisher inserted before lookup"))
     }
 
@@ -2026,9 +1833,10 @@ impl ExternalOdometryPublishers {
         session: &zenoh::Session,
         config: &AppConfig,
         body_id: i32,
+        kind: BodyTopicKind,
     ) -> Result<bool> {
         Ok(self
-            .publisher(session, config, body_id)?
+            .publisher(session, config, body_id, kind)?
             .matching_status()
             .wait()
             .map_err(|error| BridgeError::Zenoh(error.to_string()))?
@@ -2040,10 +1848,11 @@ impl ExternalOdometryPublishers {
         session: &zenoh::Session,
         config: &AppConfig,
         body_id: i32,
+        kind: BodyTopicKind,
         payload: Vec<u8>,
     ) -> Result<(String, usize)> {
         let payload_len = payload.len();
-        let publisher = self.publisher(session, config, body_id)?;
+        let publisher = self.publisher(session, config, body_id, kind)?;
         let topic = publisher.key_expr().to_string();
         publisher
             .put(payload)
@@ -2059,39 +1868,59 @@ struct OdometryOutcome {
     debug: Vec<OdometryDebugStatus>,
 }
 
-fn publish_external_odometry(
+fn publish_body_odometry(
     session: &zenoh::Session,
     config: &AppConfig,
-    frame: Option<&RigidBodyFrame>,
+    frame: &RigidBodyFrame,
     rigid_body_names: &[String],
     estimators: &mut ExternalOdometryEstimators,
-    publishers: &mut ExternalOdometryPublishers,
+    publishers: &mut BodyOdometryPublishers,
 ) -> Result<OdometryOutcome> {
-    if config.zenoh.no_external_odometry {
-        return Ok(OdometryOutcome::default());
-    }
-    let Some(frame) = frame else {
-        return Ok(OdometryOutcome::default());
-    };
-
     let mut outcome = OdometryOutcome::default();
     for body in &frame.bodies {
         // The estimator always runs so the dashboard can inspect the Kalman
-        // filter state; the Zenoh publication stays demand-driven per body.
-        let (estimate, payload) =
-            encode_external_odometry(body, frame.timestamp_us, frame.frame_number, estimators);
-        let subscribed = publishers.has_matching_subscriber(session, config, body.id)?;
-        if subscribed {
-            outcome
-                .published
-                .push(publishers.publish(session, config, body.id, payload)?);
+        // filter state; each Zenoh publication stays demand-driven per body
+        // and per topic.
+        let estimate = update_estimate(body, frame.timestamp_us, estimators);
+
+        let pose_subscribed =
+            publishers.has_matching_subscriber(session, config, body.id, BodyTopicKind::Pose)?;
+        if pose_subscribed {
+            let payload = external_odometry_payload(&estimate, body.id);
+            outcome.published.push(publishers.publish(
+                session,
+                config,
+                body.id,
+                BodyTopicKind::Pose,
+                payload,
+            )?);
+        }
+
+        let odom_subscribed =
+            publishers.has_matching_subscriber(session, config, body.id, BodyTopicKind::Odom)?;
+        if odom_subscribed {
+            let payload = odometry_estimate_payload(&estimate);
+            outcome.published.push(publishers.publish(
+                session,
+                config,
+                body.id,
+                BodyTopicKind::Odom,
+                payload,
+            )?);
         }
 
         outcome.debug.push(odometry_debug_status(
             body,
+            frame,
             rigid_body_names,
-            publishers.topic(config, body.id),
-            subscribed,
+            TopicPublicationStatus {
+                topic: publishers.topic(config, body.id, BodyTopicKind::Pose),
+                subscribed: pose_subscribed,
+            },
+            TopicPublicationStatus {
+                topic: publishers.topic(config, body.id, BodyTopicKind::Odom),
+                subscribed: odom_subscribed,
+            },
             &estimate,
         ));
     }
@@ -2099,13 +1928,12 @@ fn publish_external_odometry(
     Ok(outcome)
 }
 
-fn external_odometry_topic(prefix: &str, body_namespace: &str) -> String {
-    let key = external_odometry_topic_info().key;
-    let prefix = prefix.trim_matches('/');
-    if prefix.is_empty() {
+fn body_topic(namespace: &str, body_namespace: &str, key: &str) -> String {
+    let namespace = namespace.trim_matches('/');
+    if namespace.is_empty() {
         format!("{body_namespace}/{key}")
     } else {
-        format!("{prefix}/{body_namespace}/{key}")
+        format!("{namespace}/{body_namespace}/{key}")
     }
 }
 
@@ -2173,16 +2001,17 @@ fn sanitize_key_segment(name: &str) -> String {
 
 fn odometry_debug_status(
     body: &RigidBodyObservation,
+    frame: &RigidBodyFrame,
     rigid_body_names: &[String],
-    topic: String,
-    subscribed: bool,
+    pose: TopicPublicationStatus,
+    odom: TopicPublicationStatus,
     estimate: &ExternalOdometryEstimate,
 ) -> OdometryDebugStatus {
     OdometryDebugStatus {
         id: body.id,
         name: rigid_body_display_name(body.id, rigid_body_names),
-        topic,
-        subscribed,
+        pose,
+        odom,
         timestamp_us: estimate.timestamp_us,
         status: estimate
             .status
@@ -2190,6 +2019,11 @@ fn odometry_debug_status(
             .unwrap_or("Unknown")
             .to_owned(),
         flags: external_odometry_flag_names(estimate.flags),
+        quality_degraded: body.quality_degraded,
+        drop_rate_2d_dpermille: frame.drop_rate_2d_dpermille,
+        out_of_sync_rate_2d_dpermille: frame.out_of_sync_rate_2d_dpermille,
+        reset_counter: estimate.reset_counter,
+        quality_pct: odometry_quality_pct(estimate),
         position_enu_m: estimate.position_enu_m,
         attitude_wxyz: estimate.attitude_wxyz,
         linear_velocity_enu_m_s: estimate.linear_velocity_enu_m_s,
@@ -2221,51 +2055,146 @@ fn external_odometry_flag_names(flags: ExternalOdometryFlags) -> Vec<String> {
     .collect()
 }
 
-fn encode_external_odometry(
+/// Producer-defined estimator identifier: the Rumoca-generated 12D mocap
+/// IEKF.
+const ODOMETRY_ESTIMATOR_TYPE: u8 = 1;
+
+/// Rows/columns of the 12x12 tangent covariance selected for the
+/// OdometryEstimateData pose block ([x, y, z, rot x, rot y, rot z]).
+const POSE_COVARIANCE_ORDER: [usize; 6] = [6, 7, 8, 0, 1, 2];
+/// Selection for the velocity block ([vx, vy, vz, wx, wy, wz]).
+const VELOCITY_COVARIANCE_ORDER: [usize; 6] = [3, 4, 5, 9, 10, 11];
+
+fn update_estimate(
     body: &RigidBodyObservation,
     timestamp_us: u64,
-    _sequence: u32,
     estimators: &mut ExternalOdometryEstimators,
-) -> (ExternalOdometryEstimate, Vec<u8>) {
-    let measurement = MocapMeasurement {
-        timestamp_us,
-        position_enu_m: f64_vec3(&body.position_enu_m),
-        attitude_wxyz: f64_quat(&body.attitude),
-        tracking_valid: body.tracking_valid,
-        quality_degraded: body.quality_degraded,
-    };
-    let estimate = estimators.update(body.id, measurement);
+) -> ExternalOdometryEstimate {
+    estimators.update(
+        body.id,
+        MocapMeasurement {
+            timestamp_us,
+            position_enu_m: f64_vec3(&body.position_enu_m),
+            attitude_wxyz: f64_quat(&body.attitude),
+            tracking_valid: body.tracking_valid,
+            quality_degraded: body.quality_degraded,
+        },
+    )
+}
 
+fn external_odometry_payload(estimate: &ExternalOdometryEstimate, body_id: i32) -> Vec<u8> {
     let data = ExternalOdometryData::new(
         estimate.timestamp_us,
-        &Vec3f::new(
-            estimate.position_enu_m[0],
-            estimate.position_enu_m[1],
-            estimate.position_enu_m[2],
-        ),
-        &Quaternionf::new(
-            estimate.attitude_wxyz[0],
-            estimate.attitude_wxyz[1],
-            estimate.attitude_wxyz[2],
-            estimate.attitude_wxyz[3],
-        ),
-        &Vec3f::new(
-            estimate.linear_velocity_enu_m_s[0],
-            estimate.linear_velocity_enu_m_s[1],
-            estimate.linear_velocity_enu_m_s[2],
-        ),
-        &RateTriplet::new(
-            estimate.angular_velocity_flu_rad_s[0],
-            estimate.angular_velocity_flu_rad_s[1],
-            estimate.angular_velocity_flu_rad_s[2],
-        ),
+        &estimate_position(estimate),
+        &estimate_attitude(estimate),
+        &estimate_velocity(estimate),
+        &estimate_angular_velocity(estimate),
         estimate.flags,
         estimate.status,
         1,
-        body.id.clamp(0, u8::MAX as i32) as u8,
+        body_id.clamp(0, u8::MAX as i32) as u8,
     );
-    let payload = data.0.to_vec();
-    (estimate, payload)
+    data.0.to_vec()
+}
+
+fn odometry_estimate_payload(estimate: &ExternalOdometryEstimate) -> Vec<u8> {
+    let data = OdometryEstimateData::new(
+        estimate.timestamp_us,
+        &estimate_position(estimate),
+        &estimate_attitude(estimate),
+        &estimate_velocity(estimate),
+        &estimate_angular_velocity(estimate),
+        &covariance_upper_triangle(&estimate.covariance, POSE_COVARIANCE_ORDER),
+        &covariance_upper_triangle(&estimate.covariance, VELOCITY_COVARIANCE_ORDER),
+        estimate.reset_counter,
+        ODOMETRY_ESTIMATOR_TYPE,
+        odometry_quality_pct(estimate),
+    );
+    data.0.to_vec()
+}
+
+/// Coarse quality mapping from the estimate status for
+/// OdometryEstimateData.quality_pct; negative means unknown.
+fn odometry_quality_pct(estimate: &ExternalOdometryEstimate) -> i8 {
+    use synapse_fbs::topic::ExternalOdometryStatus;
+    match estimate.status {
+        ExternalOdometryStatus::Filtered => 100,
+        ExternalOdometryStatus::Degraded => 50,
+        ExternalOdometryStatus::ExtrapolatedShort => 25,
+        ExternalOdometryStatus::ExtrapolatedLong | ExternalOdometryStatus::OutlierRejected => 10,
+        ExternalOdometryStatus::Lost => 0,
+        _ => -1,
+    }
+}
+
+fn covariance_upper_triangle(
+    covariance: &CovarianceMatrix,
+    order: [usize; 6],
+) -> CovarianceUpperTriangle21f {
+    let mut elements = [0.0_f32; 21];
+    let mut index = 0;
+    for row in 0..6 {
+        for col in row..6 {
+            elements[index] = covariance[order[row]][order[col]] as f32;
+            index += 1;
+        }
+    }
+    CovarianceUpperTriangle21f::new(
+        elements[0],
+        elements[1],
+        elements[2],
+        elements[3],
+        elements[4],
+        elements[5],
+        elements[6],
+        elements[7],
+        elements[8],
+        elements[9],
+        elements[10],
+        elements[11],
+        elements[12],
+        elements[13],
+        elements[14],
+        elements[15],
+        elements[16],
+        elements[17],
+        elements[18],
+        elements[19],
+        elements[20],
+    )
+}
+
+fn estimate_position(estimate: &ExternalOdometryEstimate) -> Vec3f {
+    Vec3f::new(
+        estimate.position_enu_m[0],
+        estimate.position_enu_m[1],
+        estimate.position_enu_m[2],
+    )
+}
+
+fn estimate_attitude(estimate: &ExternalOdometryEstimate) -> Quaternionf {
+    Quaternionf::new(
+        estimate.attitude_wxyz[0],
+        estimate.attitude_wxyz[1],
+        estimate.attitude_wxyz[2],
+        estimate.attitude_wxyz[3],
+    )
+}
+
+fn estimate_velocity(estimate: &ExternalOdometryEstimate) -> Vec3f {
+    Vec3f::new(
+        estimate.linear_velocity_enu_m_s[0],
+        estimate.linear_velocity_enu_m_s[1],
+        estimate.linear_velocity_enu_m_s[2],
+    )
+}
+
+fn estimate_angular_velocity(estimate: &ExternalOdometryEstimate) -> RateTriplet {
+    RateTriplet::new(
+        estimate.angular_velocity_flu_rad_s[0],
+        estimate.angular_velocity_flu_rad_s[1],
+        estimate.angular_velocity_flu_rad_s[2],
+    )
 }
 
 fn qtm_mm_to_m(value: f32) -> f32 {
@@ -2301,13 +2230,7 @@ fn qtm_rate_to_dpermille(value: i16) -> u16 {
     value.max(0) as u16
 }
 
-fn qtm_rotation_matrix_to_synapse(m: [f32; 9]) -> RotationMatrix3f {
-    RotationMatrix3f::new(m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8])
-}
-
 fn qtm_rigid_body_tracking_valid(
-    _drop_rate: i16,
-    _out_of_sync_rate: i16,
     x_mm: f32,
     y_mm: f32,
     z_mm: f32,
@@ -2317,8 +2240,18 @@ fn qtm_rigid_body_tracking_valid(
         && rotation_matrix.into_iter().all(f32::is_finite)
 }
 
-fn qtm_rigid_body_quality_degraded(drop_rate: i16, out_of_sync_rate: i16) -> bool {
-    drop_rate > 0 || out_of_sync_rate > 0
+/// QTM reports 2D drop and out-of-sync rates in 1/100 of a percent; trace
+/// nonzero values are normal on real capture volumes, so only rates at or
+/// above the configured threshold mark samples as degraded. A threshold of 0
+/// disables the marking.
+fn qtm_rigid_body_quality_degraded(
+    drop_rate_dpermille: u16,
+    out_of_sync_rate_dpermille: u16,
+    threshold_dpermille: u16,
+) -> bool {
+    threshold_dpermille > 0
+        && (drop_rate_dpermille >= threshold_dpermille
+            || out_of_sync_rate_dpermille >= threshold_dpermille)
 }
 
 fn rigid_body_display_name(body_id: i32, rigid_body_names: &[String]) -> String {
@@ -2348,286 +2281,92 @@ fn rigid_body_statuses(
         .collect()
 }
 
-fn encode_mocap_frame(
+fn rigid_body_frame(
     frame: &AssembledFrame,
-    selection: &BTreeSet<MocapData>,
-    rigid_body_frame: Option<&RigidBodyFrame>,
-) -> Result<Vec<u8>> {
-    let mut builder = FlatBufferBuilder::new();
-    let rigid_body_data = rigid_body_frame.map(|frame| {
-        frame
-            .bodies
-            .iter()
-            .map(mocap_rigid_body_data)
-            .collect::<Vec<_>>()
-    });
-    let rigid_bodies = rigid_body_data
-        .as_ref()
-        .map(|data| builder.create_vector(data));
-    let markers = if selection.contains(&MocapData::LabeledMarkers) {
-        Some(builder.create_vector(&labeled_markers(frame)?))
-    } else {
-        None
-    };
-    let unlabeled_markers = if selection.contains(&MocapData::UnlabeledMarkers) {
-        Some(builder.create_vector(&unlabeled_markers(frame)?))
-    } else {
-        None
-    };
-    let drop_rate_2d_dpermille = rigid_body_frame
-        .map(|frame| frame.drop_rate_2d_dpermille)
-        .unwrap_or_default();
-    let out_of_sync_rate_2d_dpermille = rigid_body_frame
-        .map(|frame| frame.out_of_sync_rate_2d_dpermille)
-        .unwrap_or_default();
-
-    let frame = MocapFrame::create(
-        &mut builder,
-        &MocapFrameArgs {
-            timestamp_us: frame.timestamp,
-            frame_number: frame.frame_number,
-            drop_rate_2d_dpermille,
-            out_of_sync_rate_2d_dpermille,
-            source_id: 1,
-            flags: MocapRawFlags::Valid.bits(),
-            markers,
-            unlabeled_markers,
-            rigid_bodies,
-            ..MocapFrameArgs::default()
-        },
-    );
-    builder.finish(frame, None);
-    Ok(builder.finished_data().to_vec())
-}
-
-fn labeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerData>> {
-    let component = frame
-        .component(ComponentType::ThreeDResidual)
-        .or_else(|| frame.component(ComponentType::ThreeD))
-        .ok_or(BridgeError::MissingComponent("labeled marker"))?;
-
-    match &component.data {
-        ComponentData::ThreeDResidual(component) => Ok(component
-            .markers
-            .iter()
-            .enumerate()
-            .map(|(index, marker)| {
-                mocap_marker_data(
-                    (index + 1) as i32,
-                    marker.x,
-                    marker.y,
-                    marker.z,
-                    marker.residual,
-                    true,
-                    true,
-                    false,
-                    MocapRawComponent::Marker3d,
-                )
-            })
-            .collect()),
-        ComponentData::ThreeD(component) => Ok(component
-            .markers
-            .iter()
-            .enumerate()
-            .map(|(index, marker)| {
-                mocap_marker_data(
-                    (index + 1) as i32,
-                    marker.x,
-                    marker.y,
-                    marker.z,
-                    0.0,
-                    true,
-                    false,
-                    false,
-                    MocapRawComponent::Marker3d,
-                )
-            })
-            .collect()),
-        _ => Err(BridgeError::MissingComponent("labeled marker")),
-    }
-}
-
-fn unlabeled_markers(frame: &AssembledFrame) -> Result<Vec<MocapMarkerData>> {
-    let component = frame
-        .component(ComponentType::ThreeDNoLabelsResidual)
-        .or_else(|| frame.component(ComponentType::ThreeDNoLabels))
-        .ok_or(BridgeError::MissingComponent("unlabeled marker"))?;
-
-    match &component.data {
-        ComponentData::ThreeDNoLabelsResidual(component) => Ok(component
-            .markers
-            .iter()
-            .map(|marker| {
-                mocap_marker_data(
-                    marker.id,
-                    marker.x,
-                    marker.y,
-                    marker.z,
-                    marker.residual,
-                    true,
-                    true,
-                    true,
-                    MocapRawComponent::Marker3dNoLabel,
-                )
-            })
-            .collect()),
-        ComponentData::ThreeDNoLabels(component) => Ok(component
-            .markers
-            .iter()
-            .map(|marker| {
-                mocap_marker_data(
-                    marker.id,
-                    marker.x,
-                    marker.y,
-                    marker.z,
-                    0.0,
-                    true,
-                    false,
-                    true,
-                    MocapRawComponent::Marker3dNoLabel,
-                )
-            })
-            .collect()),
-        _ => Err(BridgeError::MissingComponent("unlabeled marker")),
-    }
-}
-
-fn mocap_marker_data(
-    id: i32,
-    x_mm: f32,
-    y_mm: f32,
-    z_mm: f32,
-    residual_mm: f32,
-    valid: bool,
-    residual_valid: bool,
-    tracking_id_valid: bool,
-    component: MocapRawComponent,
-) -> MocapMarkerData {
-    MocapMarkerData::new(
-        &qtm_position_m(x_mm, y_mm, z_mm),
-        residual_mm,
-        id,
-        mocap_raw_flags(valid, residual_valid, !tracking_id_valid, tracking_id_valid),
-        component,
-    )
-}
-
-fn mocap_rigid_body_data(body: &RigidBodyObservation) -> MocapRigidBodyData {
-    MocapRigidBodyData::new(
-        &body.position_enu_m,
-        &body.rotation,
-        body.residual_mm,
-        body.id,
-        mocap_raw_flags(body.tracking_valid, true, true, false),
-        MocapRawComponent::RigidBody6d,
-    )
-}
-
-fn mocap_raw_flags(
-    valid: bool,
-    residual_valid: bool,
-    label_valid: bool,
-    tracking_id_valid: bool,
-) -> u16 {
-    let mut flags = MocapRawFlags::empty();
-    if valid {
-        flags |= MocapRawFlags::Valid;
-    }
-    if residual_valid {
-        flags |= MocapRawFlags::ResidualValid;
-    }
-    if label_valid {
-        flags |= MocapRawFlags::LabelValid;
-    }
-    if tracking_id_valid {
-        flags |= MocapRawFlags::TrackingIdValid;
-    }
-    flags.bits()
-}
-
-fn rigid_body_frame(frame: &AssembledFrame) -> Result<RigidBodyFrame> {
+    degraded_threshold_dpermille: u16,
+) -> Result<RigidBodyFrame> {
     let component = frame
         .component(ComponentType::SixDResidual)
         .or_else(|| frame.component(ComponentType::SixD))
         .ok_or(BridgeError::MissingComponent("rigid body"))?;
 
     match &component.data {
-        ComponentData::SixDResidual(component) => Ok(RigidBodyFrame {
-            timestamp_us: frame.timestamp,
-            frame_number: frame.frame_number,
-            drop_rate_2d_dpermille: qtm_rate_to_dpermille(component.drop_rate),
-            out_of_sync_rate_2d_dpermille: qtm_rate_to_dpermille(component.out_of_sync_rate),
-            bodies: component
-                .bodies
-                .iter()
-                .enumerate()
-                .map(|(index, body)| {
-                    rigid_body_observation(
-                        (index + 1) as i32,
-                        component.drop_rate,
-                        component.out_of_sync_rate,
-                        body.position.x,
-                        body.position.y,
-                        body.position.z,
-                        body.rotation_matrix,
-                        body.residual,
-                    )
-                })
-                .collect(),
-        }),
-        ComponentData::SixD(component) => Ok(RigidBodyFrame {
-            timestamp_us: frame.timestamp,
-            frame_number: frame.frame_number,
-            drop_rate_2d_dpermille: qtm_rate_to_dpermille(component.drop_rate),
-            out_of_sync_rate_2d_dpermille: qtm_rate_to_dpermille(component.out_of_sync_rate),
-            bodies: component
-                .bodies
-                .iter()
-                .enumerate()
-                .map(|(index, body)| {
-                    rigid_body_observation(
-                        (index + 1) as i32,
-                        component.drop_rate,
-                        component.out_of_sync_rate,
-                        body.position.x,
-                        body.position.y,
-                        body.position.z,
-                        body.rotation_matrix,
-                        0.0,
-                    )
-                })
-                .collect(),
-        }),
+        ComponentData::SixDResidual(component) => {
+            let quality_degraded = qtm_rigid_body_quality_degraded(
+                qtm_rate_to_dpermille(component.drop_rate),
+                qtm_rate_to_dpermille(component.out_of_sync_rate),
+                degraded_threshold_dpermille,
+            );
+            Ok(RigidBodyFrame {
+                timestamp_us: frame.timestamp,
+                drop_rate_2d_dpermille: qtm_rate_to_dpermille(component.drop_rate),
+                out_of_sync_rate_2d_dpermille: qtm_rate_to_dpermille(component.out_of_sync_rate),
+                bodies: component
+                    .bodies
+                    .iter()
+                    .enumerate()
+                    .map(|(index, body)| {
+                        rigid_body_observation(
+                            (index + 1) as i32,
+                            quality_degraded,
+                            body.position.x,
+                            body.position.y,
+                            body.position.z,
+                            body.rotation_matrix,
+                            body.residual,
+                        )
+                    })
+                    .collect(),
+            })
+        }
+        ComponentData::SixD(component) => {
+            let quality_degraded = qtm_rigid_body_quality_degraded(
+                qtm_rate_to_dpermille(component.drop_rate),
+                qtm_rate_to_dpermille(component.out_of_sync_rate),
+                degraded_threshold_dpermille,
+            );
+            Ok(RigidBodyFrame {
+                timestamp_us: frame.timestamp,
+                drop_rate_2d_dpermille: qtm_rate_to_dpermille(component.drop_rate),
+                out_of_sync_rate_2d_dpermille: qtm_rate_to_dpermille(component.out_of_sync_rate),
+                bodies: component
+                    .bodies
+                    .iter()
+                    .enumerate()
+                    .map(|(index, body)| {
+                        rigid_body_observation(
+                            (index + 1) as i32,
+                            quality_degraded,
+                            body.position.x,
+                            body.position.y,
+                            body.position.z,
+                            body.rotation_matrix,
+                            0.0,
+                        )
+                    })
+                    .collect(),
+            })
+        }
         _ => Err(BridgeError::MissingComponent("rigid body")),
     }
 }
 
 fn rigid_body_observation(
     id: i32,
-    drop_rate: i16,
-    out_of_sync_rate: i16,
+    quality_degraded: bool,
     x_mm: f32,
     y_mm: f32,
     z_mm: f32,
     qtm_rotation_matrix: [f32; 9],
     residual_mm: f32,
 ) -> RigidBodyObservation {
-    let rotation = qtm_rotation_matrix_to_synapse(qtm_rotation_matrix);
     RigidBodyObservation {
         id,
         position_enu_m: qtm_position_m(x_mm, y_mm, z_mm),
         attitude: qtm_attitude_from_rotation_matrix(qtm_rotation_matrix),
-        rotation,
         residual_mm,
-        tracking_valid: qtm_rigid_body_tracking_valid(
-            drop_rate,
-            out_of_sync_rate,
-            x_mm,
-            y_mm,
-            z_mm,
-            qtm_rotation_matrix,
-        ),
-        quality_degraded: qtm_rigid_body_quality_degraded(drop_rate, out_of_sync_rate),
+        tracking_valid: qtm_rigid_body_tracking_valid(x_mm, y_mm, z_mm, qtm_rotation_matrix),
+        quality_degraded,
     }
 }
 
@@ -3163,31 +2902,25 @@ mod tests {
     fn rigid_body_tracking_accepts_finite_data_and_marks_transport_quality() {
         let rotation = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 
-        assert!(qtm_rigid_body_tracking_valid(0, 0, 1.0, 2.0, 3.0, rotation));
-        assert!(qtm_rigid_body_tracking_valid(1, 0, 1.0, 2.0, 3.0, rotation));
-        assert!(qtm_rigid_body_tracking_valid(0, 1, 1.0, 2.0, 3.0, rotation));
-        assert!(qtm_rigid_body_quality_degraded(1, 0));
-        assert!(qtm_rigid_body_quality_degraded(0, 1));
-        assert!(!qtm_rigid_body_quality_degraded(0, 0));
-        assert!(!qtm_rigid_body_tracking_valid(
-            0,
-            0,
-            f32::NAN,
-            2.0,
-            3.0,
-            rotation
-        ));
+        assert!(qtm_rigid_body_tracking_valid(1.0, 2.0, 3.0, rotation));
+        assert!(!qtm_rigid_body_tracking_valid(f32::NAN, 2.0, 3.0, rotation));
 
         let mut invalid_rotation = rotation;
         invalid_rotation[0] = f32::NAN;
         assert!(!qtm_rigid_body_tracking_valid(
-            0,
-            0,
             1.0,
             2.0,
             3.0,
             invalid_rotation
         ));
+
+        // Trace 2D loss stays below the threshold; sustained loss at or
+        // above it marks the sample, and a zero threshold disables marking.
+        assert!(!qtm_rigid_body_quality_degraded(3, 0, 100));
+        assert!(!qtm_rigid_body_quality_degraded(0, 99, 100));
+        assert!(qtm_rigid_body_quality_degraded(100, 0, 100));
+        assert!(qtm_rigid_body_quality_degraded(0, 250, 100));
+        assert!(!qtm_rigid_body_quality_degraded(1_000, 1_000, 0));
     }
 
     #[test]
@@ -3232,7 +2965,7 @@ mod tests {
             ExternalOdometryEstimators::new(estimator_config(&StreamConfig::default()));
         let body = test_observation(7, 1.0, 2.0, 3.0, qtm_quaternion(0.1, -0.2, 0.3, 0.9), true);
 
-        let (_, payload) = encode_external_odometry(&body, 123_456, 42, &mut estimators);
+        let payload = encode_pose(&body, 123_456, &mut estimators);
         assert_eq!(payload.len(), 64);
         assert_eq!(
             payload.len(),
@@ -3271,13 +3004,11 @@ mod tests {
         };
         let mut estimators = ExternalOdometryEstimators::new(estimator_config(&config));
 
-        let first = encode_external_odometry(
+        let first = encode_pose(
             &test_observation(1, 0.0, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true),
             1_000_000,
-            1,
             &mut estimators,
-        )
-        .1;
+        );
         let first = ExternalOdometryData(first.try_into().unwrap());
         assert!(
             !first
@@ -3285,13 +3016,11 @@ mod tests {
                 .contains(ExternalOdometryFlags::LinearVelocityValid)
         );
 
-        let second = encode_external_odometry(
+        let second = encode_pose(
             &test_observation(1, 0.1, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true),
             1_100_000,
-            2,
             &mut estimators,
-        )
-        .1;
+        );
         let second = ExternalOdometryData(second.try_into().unwrap());
         assert!(
             second
@@ -3304,13 +3033,11 @@ mod tests {
             second.linear_velocity_enu_m_s().x()
         );
 
-        let dropout = encode_external_odometry(
+        let dropout = encode_pose(
             &test_observation(1, 0.2, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), false),
             1_150_000,
-            3,
             &mut estimators,
-        )
-        .1;
+        );
         let dropout = ExternalOdometryData(dropout.try_into().unwrap());
         assert_eq!(dropout.status(), ExternalOdometryStatus::ExtrapolatedShort);
         assert!(
@@ -3325,13 +3052,11 @@ mod tests {
         );
         assert!(dropout.position_enu_m().x() > second.position_enu_m().x());
 
-        let reacquired = encode_external_odometry(
+        let reacquired = encode_pose(
             &test_observation(1, 0.3, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true),
             1_300_000,
-            4,
             &mut estimators,
-        )
-        .1;
+        );
         let reacquired = ExternalOdometryData(reacquired.try_into().unwrap());
         assert!(
             !reacquired
@@ -3339,13 +3064,11 @@ mod tests {
                 .contains(ExternalOdometryFlags::LinearVelocityValid)
         );
 
-        let valid_again = encode_external_odometry(
+        let valid_again = encode_pose(
             &test_observation(1, 0.4, 0.0, 0.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true),
             1_400_000,
-            5,
             &mut estimators,
-        )
-        .1;
+        );
         let valid_again = ExternalOdometryData(valid_again.try_into().unwrap());
         assert!(
             valid_again
@@ -3360,19 +3083,26 @@ mod tests {
     }
 
     #[test]
-    fn default_topics_use_synapse_fbs_catalog_keys() {
+    fn per_body_topics_nest_under_the_qualisys_namespace() {
         let config = AppConfig::default();
 
-        assert_eq!(config.zenoh.topic, "qualisys/mocap");
-        assert_eq!(config.zenoh.external_odometry_topic_prefix, "");
+        assert_eq!(config.zenoh.namespace, "qualisys");
         assert_eq!(
-            config.zenoh.rigid_body_names_topic,
-            "qualisys/rigid_body_names"
+            body_topic(&config.zenoh.namespace, "cub1", POSE_TOPIC_KEY),
+            "qualisys/cub1/pose"
         );
-        assert_eq!(external_odometry_topic("", "cub1"), "cub1/external_pose");
         assert_eq!(
-            external_odometry_topic("field_lab/", "cub1"),
-            "field_lab/cub1/external_pose"
+            body_topic(
+                &config.zenoh.namespace,
+                "cub1",
+                odometry_estimate_topic_info().key
+            ),
+            "qualisys/cub1/odom"
+        );
+        assert_eq!(body_topic("", "cub2", POSE_TOPIC_KEY), "cub2/pose");
+        assert_eq!(
+            body_topic("field_lab/qualisys/", "cub2", "odom"),
+            "field_lab/qualisys/cub2/odom"
         );
     }
 
@@ -3419,60 +3149,69 @@ mod tests {
     }
 
     #[test]
-    fn legacy_topic_defaults_migrate_to_catalog_keys() {
+    fn subscription_key_expr_covers_the_namespace() {
         let mut config = AppConfig::default();
-        config.zenoh.topic = "synapse/v1/topic/mocap_frame".to_owned();
-        config.zenoh.external_odometry_topic_prefix =
-            "synapse/v1/topic/external_odometry".to_owned();
-        config.zenoh.rigid_body_names_topic = "synapse/mocap/rigid_body_names".to_owned();
-
-        assert!(migrate_legacy_topics(&mut config));
-        assert_eq!(config.zenoh.topic, "qualisys/mocap");
-        assert_eq!(config.zenoh.external_odometry_topic_prefix, "");
-        assert_eq!(
-            config.zenoh.rigid_body_names_topic,
-            "qualisys/rigid_body_names"
-        );
-
-        config.zenoh.topic = "custom/mocap".to_owned();
-        assert!(!migrate_legacy_topics(&mut config));
-        assert_eq!(config.zenoh.topic, "custom/mocap");
-    }
-
-    #[test]
-    fn subscription_key_expr_covers_all_publication_families() {
-        let mut config = AppConfig::default();
-        assert_eq!(subscription_key_expr(&config), "**");
-
-        // Without odometry the mocap frame and rigid-body-name topics share
-        // the qualisys namespace.
-        config.zenoh.no_external_odometry = true;
         assert_eq!(subscription_key_expr(&config), "qualisys/**");
 
-        config.zenoh.no_external_odometry = false;
-        config.zenoh.external_odometry_topic_prefix = "qualisys".to_owned();
-        assert_eq!(subscription_key_expr(&config), "qualisys/**");
+        config.zenoh.namespace = "field_lab/qualisys/".to_owned();
+        assert_eq!(subscription_key_expr(&config), "field_lab/qualisys/**");
 
-        config.zenoh.external_odometry_topic_prefix = "elsewhere".to_owned();
+        config.zenoh.namespace = String::new();
         assert_eq!(subscription_key_expr(&config), "**");
     }
 
     #[test]
     fn publisher_value_contracts_match_synapse_catalog() {
         assert_eq!(
-            value_contract::encoding_for_topic(mocap_frame_topic_info()),
-            format!(
-                "application/x-flatbuffers;type=synapse.topic.MocapFrame;schema=sha256-128:{}",
-                mocap_frame_topic_info().schema_hash
-            )
-        );
-        assert_eq!(
-            value_contract::encoding_for_topic(external_odometry_topic_info()),
+            BodyTopicKind::Pose.encoding(),
             format!(
                 "application/x-synapse-struct;type=synapse.topic.ExternalOdometryData;schema=sha256-128:{}",
                 external_odometry_topic_info().schema_hash
             )
         );
+        assert_eq!(
+            BodyTopicKind::Odom.encoding(),
+            format!(
+                "application/x-synapse-struct;type=synapse.topic.OdometryEstimateData;schema=sha256-128:{}",
+                odometry_estimate_topic_info().schema_hash
+            )
+        );
+    }
+
+    #[test]
+    fn odometry_estimate_payload_carries_covariance_and_quality() {
+        let mut estimators =
+            ExternalOdometryEstimators::new(estimator_config(&StreamConfig::default()));
+        let body = test_observation(3, 1.0, 2.0, 3.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true);
+        let estimate = update_estimate(&body, 750_000, &mut estimators);
+
+        let payload = odometry_estimate_payload(&estimate);
+        assert_eq!(
+            payload.len(),
+            odometry_estimate_topic_info()
+                .payload_size
+                .expect("catalog payload size"),
+        );
+
+        let data = OdometryEstimateData(payload.try_into().unwrap());
+        assert_eq!(data.timestamp_us(), 750_000);
+        assert_eq!(data.position_enu_m().x(), 1.0);
+        assert_eq!(data.reset_counter(), 0);
+        assert_eq!(data.estimator_type(), ODOMETRY_ESTIMATOR_TYPE);
+        assert_eq!(data.quality_pct(), 100);
+        // pose covariance leads with the position variance from the
+        // configured measurement noise; the rotation block follows.
+        let expected_position_variance = 0.002_f32.powi(2);
+        assert!((data.pose_covariance().c0() - expected_position_variance).abs() < 1.0e-12);
+        // Row-major upper triangle: element (3,3) — rotation-x variance — is
+        // c15 (rows of 6, 5, 4, then 3 elements).
+        let expected_attitude_variance = 0.01_f32.powi(2);
+        assert!((data.pose_covariance().c15() - expected_attitude_variance).abs() < 1.0e-9);
+        // velocity covariance leads with the initial linear-velocity
+        // variance and ends with the angular-velocity variance.
+        let expected_velocity_variance = 25.0_f32;
+        assert!((data.velocity_covariance().c0() - expected_velocity_variance).abs() < 1.0e-3);
+        assert!((data.velocity_covariance().c20() - expected_velocity_variance).abs() < 1.0e-3);
     }
 
     #[test]
@@ -3480,27 +3219,53 @@ mod tests {
         let mut estimators =
             ExternalOdometryEstimators::new(estimator_config(&StreamConfig::default()));
         let body = test_observation(2, 1.0, 2.0, 3.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true);
-        let (estimate, _) = encode_external_odometry(&body, 500_000, 1, &mut estimators);
+        let estimate = update_estimate(&body, 500_000, &mut estimators);
 
+        let frame = RigidBodyFrame {
+            timestamp_us: 500_000,
+            drop_rate_2d_dpermille: 3,
+            out_of_sync_rate_2d_dpermille: 0,
+            bodies: Vec::new(),
+        };
         let debug = odometry_debug_status(
             &body,
+            &frame,
             &["one".to_owned(), "two".to_owned()],
-            "two/external_pose".to_owned(),
-            false,
+            TopicPublicationStatus {
+                topic: "qualisys/two/pose".to_owned(),
+                subscribed: false,
+            },
+            TopicPublicationStatus {
+                topic: "qualisys/two/odom".to_owned(),
+                subscribed: true,
+            },
             &estimate,
         );
 
         assert_eq!(debug.id, 2);
         assert_eq!(debug.name, "two");
-        assert_eq!(debug.topic, "two/external_pose");
-        assert!(!debug.subscribed);
+        assert_eq!(debug.pose.topic, "qualisys/two/pose");
+        assert!(!debug.pose.subscribed);
+        assert_eq!(debug.odom.topic, "qualisys/two/odom");
+        assert!(debug.odom.subscribed);
         assert_eq!(debug.status, "Filtered");
+        assert_eq!(debug.quality_pct, 100);
+        assert_eq!(debug.drop_rate_2d_dpermille, 3);
         assert!(debug.flags.contains(&"PositionValid".to_owned()));
         assert_eq!(debug.position_enu_m, [1.0, 2.0, 3.0]);
         // Initial position variance comes straight from the configured
         // measurement noise.
         let position_variance = debug.covariance[6][6];
         assert!((position_variance - 0.002_f64.powi(2)).abs() < 1.0e-12);
+    }
+
+    fn encode_pose(
+        body: &RigidBodyObservation,
+        timestamp_us: u64,
+        estimators: &mut ExternalOdometryEstimators,
+    ) -> Vec<u8> {
+        let estimate = update_estimate(body, timestamp_us, estimators);
+        external_odometry_payload(&estimate, body.id)
     }
 
     fn test_observation(
@@ -3515,7 +3280,6 @@ mod tests {
             id,
             position_enu_m: Vec3f::new(x_m, y_m, z_m),
             attitude,
-            rotation: RotationMatrix3f::new(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
             residual_mm: 0.0,
             tracking_valid,
             quality_degraded: false,

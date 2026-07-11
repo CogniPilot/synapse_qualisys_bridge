@@ -38,7 +38,7 @@ test("web GUI renders live QTM stream status", async ({ page }) => {
   await expect(page.locator("#rigidBodiesTable")).toContainText("sim_body_1", {
     timeout: 15_000,
   });
-  await expect(page.locator("#topicsTable")).toContainText("qualisys/mocap", {
+  await expect(page.locator("#odometryList")).toContainText("qualisys/sim_body_1/pose", {
     timeout: 15_000,
   });
 });
@@ -49,7 +49,7 @@ test("odometry debug view exposes Kalman filter state", async ({ page }) => {
   const body = page
     .locator("#odometryList > details", { hasText: "sim_body_1" })
     .first();
-  await expect(body).toContainText("sim_body_1/external_pose", {
+  await expect(body).toContainText("qualisys/sim_body_1/pose", {
     timeout: 15_000,
   });
 
@@ -76,15 +76,22 @@ test("odometry debug view exposes Kalman filter state", async ({ page }) => {
 });
 
 test("bridge publishes mocap and external odometry over real Zenoh", async () => {
-  await waitForZenohSample("qualisys/mocap", 15_000);
-  await waitForZenohSample("sim_body_1/external_pose", 20_000);
+  await waitForZenohSample("qualisys/sim_body_1/pose", 20_000);
+  await waitForZenohSample("qualisys/sim_body_1/odom", 20_000);
+  await waitForZenohSample("qualisys/sim_body_2/pose", 20_000);
 
   await expect
     .poll(async () => {
       const status = await getJson(`${ctx.webUrl}/api/status`);
       return status.topics.map((topic) => topic.key_expr);
     }, { timeout: 10_000 })
-    .toContain("sim_body_1/external_pose");
+    .toContain("qualisys/sim_body_1/pose");
+  await expect
+    .poll(async () => {
+      const status = await getJson(`${ctx.webUrl}/api/status`);
+      return status.topics.map((topic) => topic.key_expr);
+    }, { timeout: 10_000 })
+    .toContain("qualisys/sim_body_1/odom");
 });
 
 async function startStack() {
@@ -156,7 +163,6 @@ port = ${qtmPort}
 timeout_ms = 1000
 
 [stream]
-include = ["rigid-bodies"]
 transport = "udp"
 udp_bind = "127.0.0.1:0"
 velocity_max_gap_ms = 100
@@ -168,9 +174,7 @@ attitude_stddev_rad = 0.01
 mode = "router"
 connect = ""
 listen = "tcp/127.0.0.1:${zenohPort}"
-topic = "qualisys/mocap"
-external_odometry_topic_prefix = ""
-no_external_odometry = false
+namespace = "qualisys"
 admin_query_timeout_ms = 200
 
 [web]
