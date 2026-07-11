@@ -168,7 +168,7 @@
               <label>
                 <span class="field-label">
                   External odometry prefix
-                  <span class="help" tabindex="0" data-tip="Prefix for demand-driven per-rigid-body synapse.topic.ExternalOdometryData payloads." aria-label="External odometry prefix help"
+                  <span class="help" tabindex="0" data-tip="Optional namespace prepended to the per-rigid-body <body_name>/external_pose key expressions. Leave empty to publish in each body's own namespace." aria-label="External odometry prefix help"
                     >?</span>
                 </span>
                 <input id="externalOdometryPrefix" name="externalOdometryPrefix" autocomplete="off" />
@@ -270,6 +270,21 @@
             <tbody id="rigidBodiesTable"></tbody>
           </table>
         </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          <h2>
+            External Odometry
+            <span
+              class="help"
+              tabindex="0"
+              data-tip="Kalman filter estimate per rigid body. Click a body to inspect position, attitude, velocities, and covariance. Zenoh publishing starts when a subscriber matches the body's key expression."
+              aria-label="External odometry help"
+              >?</span>
+          </h2>
+        </div>
+        <div id="odometryList" class="odometry-list"></div>
       </section>
 
       <section class="panel">

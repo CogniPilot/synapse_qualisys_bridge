@@ -534,3 +534,128 @@ ol {
     grid-template-columns: 1fr;
   }
 }
+
+.odometry-list details {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.odometry-list > details {
+  margin-bottom: 10px;
+}
+
+.odometry-list > details:last-child {
+  margin-bottom: 0;
+}
+
+.odometry-list details details {
+  margin: 6px 12px 10px 30px;
+  background: #fbfcfe;
+}
+
+.odometry-list summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.odometry-list summary::-webkit-details-marker {
+  display: none;
+}
+
+.odometry-list summary::before {
+  content: "+";
+  flex: none;
+  width: 14px;
+  text-align: center;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.odometry-list details[open] > summary::before {
+  content: "−";
+}
+
+.odom-status {
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.odom-status.ok {
+  color: var(--ok);
+  background: rgba(22, 121, 76, 0.12);
+}
+
+.odom-status.warn {
+  color: var(--warn);
+  background: rgba(154, 91, 0, 0.12);
+}
+
+.odom-status.bad {
+  color: var(--bad);
+  background: rgba(179, 38, 30, 0.12);
+}
+
+.odom-badge {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.odom-meta {
+  margin: 0;
+  padding: 0 12px 8px 36px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.odom-empty {
+  margin: 0;
+}
+
+.odom-table {
+  width: auto;
+  margin: 4px 12px 10px 36px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+
+.odom-table td {
+  padding: 3px 18px 3px 0;
+  border-bottom: 0;
+}
+
+.odom-table .odom-label {
+  color: var(--muted);
+}
+
+.cov-wrap {
+  margin: 4px 12px 10px 36px;
+  border: 0;
+}
+
+.cov-table {
+  width: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+.cov-table th,
+.cov-table td {
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  text-align: right;
+  text-transform: none;
+  white-space: nowrap;
+}
+
+.cov-table .cov-diagonal {
+  background: rgba(17, 106, 123, 0.08);
+  font-weight: 600;
+}

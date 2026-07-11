@@ -38,22 +38,53 @@ test("web GUI renders live QTM stream status", async ({ page }) => {
   await expect(page.locator("#rigidBodiesTable")).toContainText("sim_body_1", {
     timeout: 15_000,
   });
-  await expect(page.locator("#topicsTable")).toContainText(
-    "synapse/v1/topic/mocap_frame",
-    { timeout: 15_000 },
-  );
+  await expect(page.locator("#topicsTable")).toContainText("qualisys/mocap", {
+    timeout: 15_000,
+  });
+});
+
+test("odometry debug view exposes Kalman filter state", async ({ page }) => {
+  await page.goto(ctx.webUrl);
+
+  const body = page
+    .locator("#odometryList > details", { hasText: "sim_body_1" })
+    .first();
+  await expect(body).toContainText("sim_body_1/external_pose", {
+    timeout: 15_000,
+  });
+
+  const position = body.locator("details", { hasText: "Position (ENU m)" }).first();
+  const covariance = body.locator("details", { hasText: "Covariance (12×12" }).first();
+  await expect(position).toBeHidden();
+
+  await body.locator("> summary").click();
+  await expect(position.locator("> summary")).toBeVisible();
+  await expect(covariance.locator("> summary")).toBeVisible();
+  await expect(position.locator(".odom-table")).toBeHidden();
+
+  await position.locator("> summary").click();
+  await expect(position.locator(".odom-table")).toBeVisible();
+  await expect(position.locator(".odom-table")).toContainText("±");
+
+  await covariance.locator("> summary").click();
+  await expect(covariance.locator(".cov-table")).toBeVisible();
+
+  // Expanded nodes must survive the periodic status re-render.
+  await page.waitForTimeout(2_000);
+  await expect(position.locator(".odom-table")).toBeVisible();
+  await expect(covariance.locator(".cov-table")).toBeVisible();
 });
 
 test("bridge publishes mocap and external odometry over real Zenoh", async () => {
-  await waitForZenohSample("synapse/v1/topic/mocap_frame", 15_000);
-  await waitForZenohSample("synapse/v1/topic/external_odometry/1", 20_000);
+  await waitForZenohSample("qualisys/mocap", 15_000);
+  await waitForZenohSample("sim_body_1/external_pose", 20_000);
 
   await expect
     .poll(async () => {
       const status = await getJson(`${ctx.webUrl}/api/status`);
       return status.topics.map((topic) => topic.key_expr);
     }, { timeout: 10_000 })
-    .toContain("synapse/v1/topic/external_odometry/1");
+    .toContain("sim_body_1/external_pose");
 });
 
 async function startStack() {
@@ -137,8 +168,8 @@ attitude_stddev_rad = 0.01
 mode = "router"
 connect = ""
 listen = "tcp/127.0.0.1:${zenohPort}"
-topic = "synapse/v1/topic/mocap_frame"
-external_odometry_topic_prefix = "synapse/v1/topic/external_odometry"
+topic = "qualisys/mocap"
+external_odometry_topic_prefix = ""
 no_external_odometry = false
 admin_query_timeout_ms = 200
 

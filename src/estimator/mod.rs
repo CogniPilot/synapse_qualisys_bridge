@@ -19,7 +19,10 @@ const MIN_VARIANCE: f64 = 1.0e-12;
 
 type Vector12 = [f64; TANGENT_LEN];
 type Vector6 = [f64; MEASUREMENT_LEN];
-type Matrix12 = [[f64; TANGENT_LEN]; TANGENT_LEN];
+/// Covariance over the 12D tangent state, ordered as attitude (rad),
+/// linear velocity (m/s), position (m), and angular velocity (rad/s) blocks.
+pub type CovarianceMatrix = [[f64; TANGENT_LEN]; TANGENT_LEN];
+type Matrix12 = CovarianceMatrix;
 type Matrix6 = [[f64; MEASUREMENT_LEN]; MEASUREMENT_LEN];
 
 #[derive(Debug, Clone, Copy)]
@@ -76,6 +79,7 @@ pub struct ExternalOdometryEstimate {
     pub angular_velocity_flu_rad_s: [f32; 3],
     pub status: ExternalOdometryStatus,
     pub flags: ExternalOdometryFlags,
+    pub covariance: CovarianceMatrix,
 }
 
 impl ExternalOdometryEstimate {
@@ -88,6 +92,7 @@ impl ExternalOdometryEstimate {
             angular_velocity_flu_rad_s: [0.0; 3],
             status: ExternalOdometryStatus::Lost,
             flags: ExternalOdometryFlags::Lost,
+            covariance: zero_matrix12(),
         }
     }
 }
@@ -115,10 +120,6 @@ impl ExternalOdometryEstimators {
             .entry(body_id)
             .or_insert_with(|| MocapExternalOdometryEstimator::new(self.config))
             .update(measurement)
-    }
-
-    pub fn clear_body(&mut self, body_id: i32) {
-        self.estimators.remove(&body_id);
     }
 }
 
@@ -201,6 +202,9 @@ impl MocapExternalOdometryEstimator {
         if norm3([residual[0], residual[1], residual[2]]) > self.config.attitude_gate_rad
             || norm3([residual[3], residual[4], residual[5]]) > self.config.position_gate_m
         {
+            // Rejected samples never advance last_mocap_timestamp_us, so
+            // disagreement outlasting the dropout budget re-initializes via
+            // the max-gap check above instead of rejecting forever.
             self.frames_since_last_mocap_count =
                 self.frames_since_last_mocap_count.saturating_add(1);
             return self.estimate(
@@ -450,6 +454,7 @@ impl MocapExternalOdometryEstimator {
             angular_velocity_flu_rad_s: f32_array(self.angular_velocity()),
             status,
             flags,
+            covariance: self.covariance(),
         }
     }
 
@@ -871,6 +876,42 @@ mod tests {
         });
         assert_eq!(reacquired.status, ExternalOdometryStatus::Filtered);
         assert!((reacquired.position_enu_m[0] - 5.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn persistent_outliers_reacquire_after_max_gap() {
+        let config = MocapExternalOdometryEstimatorConfig::default();
+        let mut estimator = MocapExternalOdometryEstimator::new(config);
+        estimator.update(MocapMeasurement {
+            timestamp_us: 1_000_000,
+            position_enu_m: [0.0, 0.0, 0.0],
+            attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
+            tracking_valid: true,
+            quality_degraded: false,
+        });
+
+        // A sustained 10 m jump with valid tracking: rejected while inside
+        // the dropout budget, then re-acquired instead of locking out.
+        let mut timestamp_us = 1_000_000;
+        let mut last = None;
+        while timestamp_us < 1_000_000 + config.max_gap_us + 8_000 {
+            timestamp_us += 4_000;
+            last = Some(estimator.update(MocapMeasurement {
+                timestamp_us,
+                position_enu_m: [10.0, 0.0, 0.0],
+                attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
+                tracking_valid: true,
+                quality_degraded: false,
+            }));
+        }
+
+        let last = last.expect("at least one update");
+        assert_eq!(last.status, ExternalOdometryStatus::Filtered);
+        assert!(
+            (last.position_enu_m[0] - 10.0).abs() < 1.0e-3,
+            "reacquired x = {}",
+            last.position_enu_m[0]
+        );
     }
 
     #[test]

@@ -1,3 +1,7 @@
+// Windows builds are GUI-subsystem so end users never see a console window;
+// CLI output still works there because main() re-attaches the parent console.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -13,7 +17,8 @@ mod estimator;
 
 use clap::{ArgAction, Parser, ValueEnum};
 use estimator::{
-    ExternalOdometryEstimators, MocapExternalOdometryEstimatorConfig, MocapMeasurement,
+    CovarianceMatrix, ExternalOdometryEstimate, ExternalOdometryEstimators,
+    MocapExternalOdometryEstimatorConfig, MocapMeasurement,
 };
 use flatbuffers::FlatBufferBuilder;
 use qualisys_rust_sdk::rt::{
@@ -25,9 +30,11 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use synapse_fbs::synapse::types::{Quaternionf, RateTriplet, RotationMatrix3f, Vec3f};
 use synapse_fbs::topic::{
-    ExternalOdometryData, MocapFrame, MocapFrameArgs, MocapMarkerData, MocapRawComponent,
-    MocapRawFlags, MocapRigidBodyData,
+    ExternalOdometryData, ExternalOdometryFlags, MocapFrame, MocapFrameArgs, MocapMarkerData,
+    MocapRawComponent, MocapRawFlags, MocapRigidBodyData,
 };
+use synapse_fbs::topic_catalog::{self, TopicInfo};
+use synapse_fbs::value_contract;
 use thiserror::Error;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use zenoh::pubsub::Publisher;
@@ -224,8 +231,9 @@ struct ZenohArgs {
         long = "external-odometry-topic-prefix",
         alias = "rigid-body-pose-topic-prefix",
         env = "ZENOH_EXTERNAL_ODOMETRY_TOPIC_PREFIX",
-        value_name = "KEYEXPR",
-        help = "Zenoh key expression prefix for bare ExternalOdometry payloads"
+        value_name = "NAMESPACE",
+        help = "Optional namespace prepended to per-rigid-body \
+                [<prefix>/]<body_name>/external_pose key expressions"
     )]
     external_odometry_topic_prefix: Option<String>,
 
@@ -386,13 +394,34 @@ impl Default for ZenohConfig {
             mode: ZenohMode::Router,
             connect: String::new(),
             listen: "udp/0.0.0.0:7447,tcp/0.0.0.0:7447".to_owned(),
-            topic: "synapse/v1/topic/mocap_frame".to_owned(),
-            external_odometry_topic_prefix: "synapse/v1/topic/external_odometry".to_owned(),
-            rigid_body_names_topic: "synapse/mocap/rigid_body_names".to_owned(),
+            topic: default_mocap_topic(),
+            external_odometry_topic_prefix: String::new(),
+            rigid_body_names_topic: default_rigid_body_names_topic(),
             no_external_odometry: false,
             admin_query_timeout_ms: 1_000,
         }
     }
+}
+
+/// The synapse_fbs 0.6 catalog key for raw mocap frames, published under the
+/// mocap system's own `qualisys` namespace per the synapse_fbs README.
+fn default_mocap_topic() -> String {
+    format!("qualisys/{}", mocap_frame_topic_info().key)
+}
+
+/// The JSON id/name mapping is bridge-specific (not a catalog topic) but
+/// still publishes under the mocap system's `qualisys` namespace.
+fn default_rigid_body_names_topic() -> String {
+    "qualisys/rigid_body_names".to_owned()
+}
+
+fn mocap_frame_topic_info() -> &'static TopicInfo {
+    topic_catalog::topic_by_name("MocapFrame").expect("MocapFrame in synapse_fbs topic catalog")
+}
+
+fn external_odometry_topic_info() -> &'static TopicInfo {
+    topic_catalog::topic_by_name("ExternalOdometry")
+        .expect("ExternalOdometry in synapse_fbs topic catalog")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -540,6 +569,7 @@ impl AppHandle {
             stats: state.stats.clone(),
             topics: state.topics.values().cloned().collect(),
             rigid_bodies: state.rigid_bodies.clone(),
+            odometry: state.odometry.clone(),
             logs: state.logs.iter().cloned().collect(),
             update: state.update.clone(),
         }
@@ -576,6 +606,7 @@ impl AppHandle {
             app.stats = BridgeStats::default();
             app.topics.clear();
             app.rigid_bodies.clear();
+            app.odometry.clear();
             app.rate_window_at_ms = now_ms();
             app.rate_window_frames = 0;
         });
@@ -586,6 +617,7 @@ impl AppHandle {
         frame_number: u32,
         timestamp_us: u64,
         rigid_bodies: Vec<RigidBodyStatus>,
+        odometry: Vec<OdometryDebugStatus>,
     ) {
         let now = now_ms();
         self.update_state(|app| {
@@ -594,6 +626,7 @@ impl AppHandle {
             app.stats.last_frame_timestamp_us = Some(timestamp_us);
             app.stats.last_frame_at_ms = Some(now);
             app.rigid_bodies = rigid_bodies;
+            app.odometry = odometry;
 
             let delta_ms = now.saturating_sub(app.rate_window_at_ms);
             if delta_ms >= 1_000 {
@@ -908,6 +941,7 @@ struct AppSnapshot {
     stats: BridgeStats,
     topics: Vec<TopicStats>,
     rigid_bodies: Vec<RigidBodyStatus>,
+    odometry: Vec<OdometryDebugStatus>,
     logs: Vec<LogEntry>,
     update: UpdateStatus,
 }
@@ -976,6 +1010,23 @@ struct RigidBodyStatus {
     tracking_valid: bool,
 }
 
+/// Kalman filter state exposed per rigid body for the dashboard debug view.
+#[derive(Debug, Clone, Serialize)]
+struct OdometryDebugStatus {
+    id: i32,
+    name: String,
+    topic: String,
+    subscribed: bool,
+    timestamp_us: u64,
+    status: String,
+    flags: Vec<String>,
+    position_enu_m: [f32; 3],
+    attitude_wxyz: [f32; 4],
+    linear_velocity_enu_m_s: [f32; 3],
+    angular_velocity_flu_rad_s: [f32; 3],
+    covariance: CovarianceMatrix,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct LogEntry {
     time_ms: u128,
@@ -1020,6 +1071,7 @@ struct AppState {
     stats: BridgeStats,
     topics: BTreeMap<String, TopicStats>,
     rigid_bodies: Vec<RigidBodyStatus>,
+    odometry: Vec<OdometryDebugStatus>,
     logs: VecDeque<LogEntry>,
     update: UpdateStatus,
     rate_window_at_ms: u128,
@@ -1035,6 +1087,7 @@ impl AppState {
             stats: BridgeStats::default(),
             topics: BTreeMap::new(),
             rigid_bodies: Vec::new(),
+            odometry: Vec::new(),
             logs: VecDeque::new(),
             update: UpdateStatus::default(),
             rate_window_at_ms: now_ms(),
@@ -1089,6 +1142,9 @@ struct GitHubAsset {
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    attach_parent_console();
+
     let cli = Cli::parse();
 
     if let Some(path) = cli.write_default_config.as_ref() {
@@ -1099,16 +1155,35 @@ fn main() -> Result<()> {
 
     let config_path = resolve_config_path(cli.config.as_deref());
     let mut config = load_config_or_default(&config_path)?;
+    // Persist migrated topics before CLI overrides so one-shot flags such as
+    // --open never leak into the saved configuration.
+    let migrated_topics = migrate_legacy_topics(&mut config);
+    if migrated_topics {
+        save_config(&config_path, &config)?;
+    }
     apply_cli_overrides(&mut config, &cli);
     ensure_config_file(&config_path, &config)?;
 
     let log_path = resolve_log_path(&config);
     let app = AppHandle::new(config.clone(), config_path, log_path);
+    #[cfg(windows)]
+    spawn_close_listener(&app);
     app.log("info", format!("{APP_NAME} {}", env!("CARGO_PKG_VERSION")));
     app.log(
         "info",
         format!("Using configuration {}", app.0.config_path.display()),
     );
+    if migrated_topics {
+        app.log(
+            "info",
+            format!(
+                "Migrated legacy synapse/v1 topic defaults to the synapse_fbs 0.6 keys \
+                 ({} and [<prefix>/]<body_name>/{})",
+                app.config().zenoh.topic,
+                external_odometry_topic_info().key
+            ),
+        );
+    }
 
     if !config.web.enabled {
         app.log(
@@ -1140,12 +1215,247 @@ fn main() -> Result<()> {
     }
 
     if config.web.open_browser {
-        open_browser(&url);
+        open_dashboard(&app, &url);
     }
 
     loop {
         thread::park();
     }
+}
+
+/// Open the dashboard for the end user. On Windows this prefers a dedicated
+/// app-mode browser window whose lifetime owns the bridge process: closing
+/// the window shuts the bridge down. Elsewhere, or when no app-mode browser
+/// is available, it falls back to the default browser without lifecycle
+/// coupling.
+fn open_dashboard(app: &AppHandle, url: &str) {
+    #[cfg(windows)]
+    match launch_app_window(url) {
+        Ok(mut child) => {
+            app.log(
+                "info",
+                "Dashboard opened in an application window; closing it stops the bridge",
+            );
+            let watcher = app.clone();
+            thread::spawn(move || {
+                let _ = child.wait();
+                watcher.log("info", "Dashboard window closed; shutting down");
+                shutdown(&watcher);
+            });
+            return;
+        }
+        Err(error) => {
+            app.log(
+                "warn",
+                format!("No app-mode browser available ({error}); using the default browser"),
+            );
+        }
+    }
+
+    app.log("info", format!("Opening dashboard at {url}"));
+    open_browser(url);
+}
+
+#[cfg(windows)]
+fn launch_app_window(url: &str) -> Result<std::process::Child> {
+    // A dedicated profile directory forces a new browser process that owns
+    // the app window, so waiting on the child reliably observes the window
+    // closing even when the user's regular browser is already running. The
+    // directory must be unique per launch: Chromium enforces one process per
+    // user-data-dir, and a leftover window from an earlier bridge (for
+    // example across an auto-update relaunch) would otherwise absorb the new
+    // launch and make the child exit immediately, shutting the bridge down.
+    let profiles_dir = platform_app_dir().join("app-window-profiles");
+    fs::create_dir_all(&profiles_dir)?;
+    if let Ok(entries) = fs::read_dir(&profiles_dir) {
+        for entry in entries.flatten() {
+            // Best-effort cleanup; directories still locked by a live
+            // browser fail removal and are left alone.
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+    let profile_dir = profiles_dir.join(format!("run-{}-{}", std::process::id(), now_ms()));
+    fs::create_dir_all(&profile_dir)?;
+
+    let mut errors = Vec::new();
+    for browser in app_window_browsers() {
+        match Command::new(&browser)
+            .arg(format!("--app={url}"))
+            .arg(format!("--user-data-dir={}", profile_dir.display()))
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(error) => errors.push(format!("{}: {error}", browser.display())),
+        }
+    }
+
+    Err(BridgeError::Web(if errors.is_empty() {
+        "no Edge or Chrome installation found".to_owned()
+    } else {
+        errors.join("; ")
+    }))
+}
+
+#[cfg(windows)]
+fn app_window_browsers() -> Vec<PathBuf> {
+    let suffixes = [
+        r"Microsoft\Edge\Application\msedge.exe",
+        r"Google\Chrome\Application\chrome.exe",
+    ];
+    let roots = ["ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"];
+    let mut browsers = Vec::new();
+    for suffix in suffixes {
+        for root in roots {
+            if let Some(root) = std::env::var_os(root) {
+                let path = PathBuf::from(root).join(suffix);
+                if path.exists() {
+                    browsers.push(path);
+                }
+            }
+        }
+    }
+    browsers
+}
+
+#[cfg(windows)]
+fn shutdown(app: &AppHandle) -> ! {
+    app.stop_bridge();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let finished = app
+            .0
+            .bridge_worker
+            .lock()
+            .expect("bridge lock poisoned")
+            .as_ref()
+            .is_none_or(|worker| worker.join.is_finished());
+        if finished {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = app.close_zenoh_session();
+    app.log("info", "Shutdown complete");
+    std::process::exit(0);
+}
+
+/// GUI-subsystem Windows binaries detach from the console; re-attach to the
+/// parent's console so `--help` and log output still appear when the bridge
+/// is launched from a terminal. Fails silently when there is no parent
+/// console (Explorer, Start Menu, installer).
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(windows)]
+static CLOSE_LISTENER_APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+
+/// A GUI-subsystem process with no window is invisible to the Restart
+/// Manager, so installer upgrades and session logoff could only terminate it
+/// hard. Own an invisible top-level window that answers WM_CLOSE and
+/// WM_ENDSESSION with a graceful shutdown.
+#[cfg(windows)]
+fn spawn_close_listener(app: &AppHandle) {
+    if CLOSE_LISTENER_APP.set(app.clone()).is_err() {
+        return;
+    }
+
+    thread::spawn(|| unsafe {
+        use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG, RegisterClassW,
+            TranslateMessage, WM_CLOSE, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW,
+            WS_OVERLAPPED,
+        };
+
+        unsafe extern "system" fn close_wndproc(
+            hwnd: HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            match message {
+                WM_QUERYENDSESSION => 1,
+                WM_ENDSESSION if wparam == 0 => 0,
+                WM_CLOSE | WM_ENDSESSION => {
+                    if let Some(app) = CLOSE_LISTENER_APP.get() {
+                        app.log("info", "Close requested by the system; shutting down");
+                        shutdown(app);
+                    }
+                    0
+                }
+                _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+            }
+        }
+
+        let class_name: Vec<u16> = "SynapseQualisysBridgeCloseListener\0"
+            .encode_utf16()
+            .collect();
+        let window_name: Vec<u16> = "Synapse Qualisys Bridge\0".encode_utf16().collect();
+        let instance = GetModuleHandleW(std::ptr::null());
+        let mut class: WNDCLASSW = std::mem::zeroed();
+        class.lpfnWndProc = Some(close_wndproc);
+        class.hInstance = instance;
+        class.lpszClassName = class_name.as_ptr();
+        if RegisterClassW(&class) == 0 {
+            return;
+        }
+
+        // Never shown: the window exists only to receive close requests.
+        let window = CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            window_name.as_ptr(),
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            instance,
+            std::ptr::null(),
+        );
+        if window.is_null() {
+            return;
+        }
+
+        let mut message: MSG = std::mem::zeroed();
+        while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    });
+}
+
+/// Rewrite the pre-0.6 default key expressions from saved configurations to
+/// the synapse_fbs 0.6 catalog defaults. Custom values are left untouched.
+fn migrate_legacy_topics(config: &mut AppConfig) -> bool {
+    const LEGACY_MOCAP_TOPIC: &str = "synapse/v1/topic/mocap_frame";
+    const LEGACY_EXTERNAL_ODOMETRY_PREFIX: &str = "synapse/v1/topic/external_odometry";
+    const LEGACY_RIGID_BODY_NAMES_TOPIC: &str = "synapse/mocap/rigid_body_names";
+
+    let mut migrated = false;
+    if config.zenoh.topic == LEGACY_MOCAP_TOPIC {
+        config.zenoh.topic = default_mocap_topic();
+        migrated = true;
+    }
+    if config.zenoh.external_odometry_topic_prefix == LEGACY_EXTERNAL_ODOMETRY_PREFIX {
+        config.zenoh.external_odometry_topic_prefix = String::new();
+        migrated = true;
+    }
+    if config.zenoh.rigid_body_names_topic == LEGACY_RIGID_BODY_NAMES_TOPIC {
+        config.zenoh.rigid_body_names_topic = default_rigid_body_names_topic();
+        migrated = true;
+    }
+    migrated
 }
 
 fn apply_cli_overrides(config: &mut AppConfig, cli: &Cli) {
@@ -1265,6 +1575,7 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
 
     let publisher = session
         .declare_publisher(config.zenoh.topic.clone())
+        .encoding(value_contract::encoding_for_topic(mocap_frame_topic_info()))
         .wait()
         .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
     let rigid_body_names_publisher = session
@@ -1326,7 +1637,8 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
 
     let mut accumulator = FrameAccumulator::for_components(components);
     let mut odometry_estimators = ExternalOdometryEstimators::new(estimator_config(&config.stream));
-    let mut odometry_publishers = ExternalOdometryPublishers::default();
+    let mut odometry_publishers =
+        ExternalOdometryPublishers::new(external_odometry_namespaces(&rigid_body_names));
     while !stop.load(Ordering::SeqCst) {
         if Instant::now() >= next_rigid_body_names_publish {
             rigid_body_names_publisher
@@ -1361,14 +1673,15 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
                         payload_len,
                     );
 
-                    let odometry_topics = publish_external_odometry(
+                    let odometry = publish_external_odometry(
                         &session,
                         config,
                         rigid_body_frame.as_ref(),
+                        &rigid_body_names,
                         &mut odometry_estimators,
                         &mut odometry_publishers,
                     )?;
-                    for (topic, payload_len) in odometry_topics {
+                    for (topic, payload_len) in odometry.published {
                         app.record_topic(topic, "external odometry publisher", payload_len);
                     }
 
@@ -1376,7 +1689,12 @@ fn run_bridge_once(config: &AppConfig, app: &AppHandle, stop: &AtomicBool) -> Re
                         .as_ref()
                         .map(|body_frame| rigid_body_statuses(body_frame, &rigid_body_names))
                         .unwrap_or_default();
-                    app.record_frame(frame.frame_number, frame.timestamp, body_statuses);
+                    app.record_frame(
+                        frame.frame_number,
+                        frame.timestamp,
+                        body_statuses,
+                        odometry.debug,
+                    );
                 }
             }
             StreamPacket::NoMoreData => return Ok(()),
@@ -1480,14 +1798,33 @@ fn local_network_ip() -> Option<IpAddr> {
 }
 
 fn subscription_key_expr(config: &AppConfig) -> String {
-    let topics = [
+    // Odometry keys live under per-body vehicle namespaces
+    // ([<prefix>/]<body_name>/external_pose), so with an empty prefix no
+    // expression narrower than `**` covers them.
+    let odometry_prefix = config
+        .zenoh
+        .external_odometry_topic_prefix
+        .trim_matches('/');
+    if !config.zenoh.no_external_odometry && odometry_prefix.is_empty() {
+        return "**".to_owned();
+    }
+
+    let mut topics = vec![
         config.zenoh.topic.as_str(),
-        config.zenoh.external_odometry_topic_prefix.as_str(),
         config.zenoh.rigid_body_names_topic.as_str(),
     ];
+    if !config.zenoh.no_external_odometry {
+        topics.push(odometry_prefix);
+    }
     let parts: Vec<Vec<&str>> = topics
         .iter()
-        .map(|topic| topic.trim_matches('/').split('/').collect())
+        .map(|topic| {
+            topic
+                .trim_matches('/')
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .collect()
+        })
         .filter(|parts: &Vec<&str>| !parts.is_empty())
         .collect();
 
@@ -1508,7 +1845,7 @@ fn subscription_key_expr(config: &AppConfig) -> String {
     }
 
     if shared.is_empty() {
-        config.zenoh.topic.clone()
+        "**".to_owned()
     } else {
         format!("{}/**", shared.join("/"))
     }
@@ -1638,12 +1975,29 @@ fn estimator_config(config: &StreamConfig) -> MocapExternalOdometryEstimatorConf
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ExternalOdometryPublishers {
     publishers: BTreeMap<i32, Publisher<'static>>,
+    namespaces: BTreeMap<i32, String>,
 }
 
 impl ExternalOdometryPublishers {
+    fn new(namespaces: BTreeMap<i32, String>) -> Self {
+        Self {
+            publishers: BTreeMap::new(),
+            namespaces,
+        }
+    }
+
+    fn topic(&self, config: &AppConfig, body_id: i32) -> String {
+        let namespace = self
+            .namespaces
+            .get(&body_id)
+            .cloned()
+            .unwrap_or_else(|| format!("body_{}", body_id.max(0)));
+        external_odometry_topic(&config.zenoh.external_odometry_topic_prefix, &namespace)
+    }
+
     fn publisher(
         &mut self,
         session: &zenoh::Session,
@@ -1651,10 +2005,11 @@ impl ExternalOdometryPublishers {
         body_id: i32,
     ) -> Result<&Publisher<'static>> {
         if !self.publishers.contains_key(&body_id) {
-            let topic =
-                external_odometry_topic(&config.zenoh.external_odometry_topic_prefix, body_id);
             let publisher = session
-                .declare_publisher(topic)
+                .declare_publisher(self.topic(config, body_id))
+                .encoding(value_contract::encoding_for_topic(
+                    external_odometry_topic_info(),
+                ))
                 .wait()
                 .map_err(|error| BridgeError::Zenoh(error.to_string()))?;
             self.publishers.insert(body_id, publisher);
@@ -1698,37 +2053,172 @@ impl ExternalOdometryPublishers {
     }
 }
 
+#[derive(Debug, Default)]
+struct OdometryOutcome {
+    published: Vec<(String, usize)>,
+    debug: Vec<OdometryDebugStatus>,
+}
+
 fn publish_external_odometry(
     session: &zenoh::Session,
     config: &AppConfig,
     frame: Option<&RigidBodyFrame>,
+    rigid_body_names: &[String],
     estimators: &mut ExternalOdometryEstimators,
     publishers: &mut ExternalOdometryPublishers,
-) -> Result<Vec<(String, usize)>> {
+) -> Result<OdometryOutcome> {
     if config.zenoh.no_external_odometry {
-        return Ok(Vec::new());
+        return Ok(OdometryOutcome::default());
     }
     let Some(frame) = frame else {
-        return Ok(Vec::new());
+        return Ok(OdometryOutcome::default());
     };
 
-    let mut published = Vec::new();
+    let mut outcome = OdometryOutcome::default();
     for body in &frame.bodies {
-        if !publishers.has_matching_subscriber(session, config, body.id)? {
-            estimators.clear_body(body.id);
-            continue;
+        // The estimator always runs so the dashboard can inspect the Kalman
+        // filter state; the Zenoh publication stays demand-driven per body.
+        let (estimate, payload) =
+            encode_external_odometry(body, frame.timestamp_us, frame.frame_number, estimators);
+        let subscribed = publishers.has_matching_subscriber(session, config, body.id)?;
+        if subscribed {
+            outcome
+                .published
+                .push(publishers.publish(session, config, body.id, payload)?);
         }
 
-        let payload =
-            encode_external_odometry(body, frame.timestamp_us, frame.frame_number, estimators);
-        published.push(publishers.publish(session, config, body.id, payload)?);
+        outcome.debug.push(odometry_debug_status(
+            body,
+            rigid_body_names,
+            publishers.topic(config, body.id),
+            subscribed,
+            &estimate,
+        ));
     }
 
-    Ok(published)
+    Ok(outcome)
 }
 
-fn external_odometry_topic(prefix: &str, body_id: i32) -> String {
-    format!("{}/{}", prefix.trim_end_matches('/'), body_id.max(0))
+fn external_odometry_topic(prefix: &str, body_namespace: &str) -> String {
+    let key = external_odometry_topic_info().key;
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        format!("{body_namespace}/{key}")
+    } else {
+        format!("{prefix}/{body_namespace}/{key}")
+    }
+}
+
+/// Map QTM rigid-body ids to the vehicle namespace their odometry publishes
+/// under: the body name sanitized to a lowercase snake_case Zenoh key
+/// segment, deduplicated and with a `body_<id>` fallback for unusable names.
+fn external_odometry_namespaces(rigid_body_names: &[String]) -> BTreeMap<i32, String> {
+    let mut used = BTreeSet::new();
+    let mut namespaces = BTreeMap::new();
+    for (index, name) in rigid_body_names.iter().enumerate() {
+        let body_id = index as i32 + 1;
+        let sanitized = sanitize_key_segment(name);
+        let mut namespace = if usable_body_namespace(&sanitized, body_id) {
+            sanitized
+        } else {
+            format!("body_{body_id}")
+        };
+        if !used.insert(namespace.clone()) {
+            let base = namespace;
+            namespace = format!("{base}_{body_id}");
+            let mut counter = 2;
+            while !used.insert(namespace.clone()) {
+                namespace = format!("{base}_{body_id}_{counter}");
+                counter += 1;
+            }
+        }
+        namespaces.insert(body_id, namespace);
+    }
+    namespaces
+}
+
+/// A sanitized body name is unusable as a namespace when it is empty, all
+/// digits, a reserved Zenoh segment, or shaped like another body's
+/// `body_<id>` fallback (which would collide with ids missing from the
+/// parameter list).
+fn usable_body_namespace(sanitized: &str, body_id: i32) -> bool {
+    if sanitized.is_empty()
+        || sanitized.bytes().all(|byte| byte.is_ascii_digit())
+        || matches!(sanitized, "cmd" | "meta" | "live")
+    {
+        return false;
+    }
+    match sanitized.strip_prefix("body_") {
+        Some(digits) if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) => {
+            digits == body_id.to_string()
+        }
+        _ => true,
+    }
+}
+
+fn sanitize_key_segment(name: &str) -> String {
+    let mut segment = String::new();
+    let mut last_was_underscore = false;
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            segment.push(ch.to_ascii_lowercase());
+            last_was_underscore = false;
+        } else if !last_was_underscore {
+            segment.push('_');
+            last_was_underscore = true;
+        }
+    }
+    segment.trim_matches('_').to_owned()
+}
+
+fn odometry_debug_status(
+    body: &RigidBodyObservation,
+    rigid_body_names: &[String],
+    topic: String,
+    subscribed: bool,
+    estimate: &ExternalOdometryEstimate,
+) -> OdometryDebugStatus {
+    OdometryDebugStatus {
+        id: body.id,
+        name: rigid_body_display_name(body.id, rigid_body_names),
+        topic,
+        subscribed,
+        timestamp_us: estimate.timestamp_us,
+        status: estimate
+            .status
+            .variant_name()
+            .unwrap_or("Unknown")
+            .to_owned(),
+        flags: external_odometry_flag_names(estimate.flags),
+        position_enu_m: estimate.position_enu_m,
+        attitude_wxyz: estimate.attitude_wxyz,
+        linear_velocity_enu_m_s: estimate.linear_velocity_enu_m_s,
+        angular_velocity_flu_rad_s: estimate.angular_velocity_flu_rad_s,
+        covariance: estimate.covariance,
+    }
+}
+
+fn external_odometry_flag_names(flags: ExternalOdometryFlags) -> Vec<String> {
+    [
+        (ExternalOdometryFlags::PositionValid, "PositionValid"),
+        (ExternalOdometryFlags::AttitudeValid, "AttitudeValid"),
+        (
+            ExternalOdometryFlags::LinearVelocityValid,
+            "LinearVelocityValid",
+        ),
+        (
+            ExternalOdometryFlags::AngularVelocityValid,
+            "AngularVelocityValid",
+        ),
+        (ExternalOdometryFlags::Extrapolated, "Extrapolated"),
+        (ExternalOdometryFlags::OutlierRejected, "OutlierRejected"),
+        (ExternalOdometryFlags::Degraded, "Degraded"),
+        (ExternalOdometryFlags::Lost, "Lost"),
+    ]
+    .into_iter()
+    .filter(|(flag, _)| flags.contains(*flag))
+    .map(|(_, name)| name.to_owned())
+    .collect()
 }
 
 fn encode_external_odometry(
@@ -1736,7 +2226,7 @@ fn encode_external_odometry(
     timestamp_us: u64,
     _sequence: u32,
     estimators: &mut ExternalOdometryEstimators,
-) -> Vec<u8> {
+) -> (ExternalOdometryEstimate, Vec<u8>) {
     let measurement = MocapMeasurement {
         timestamp_us,
         position_enu_m: f64_vec3(&body.position_enu_m),
@@ -1774,7 +2264,8 @@ fn encode_external_odometry(
         1,
         body.id.clamp(0, u8::MAX as i32) as u8,
     );
-    data.0.to_vec()
+    let payload = data.0.to_vec();
+    (estimate, payload)
 }
 
 fn qtm_mm_to_m(value: f32) -> f32 {
@@ -1830,6 +2321,15 @@ fn qtm_rigid_body_quality_degraded(drop_rate: i16, out_of_sync_rate: i16) -> boo
     drop_rate > 0 || out_of_sync_rate > 0
 }
 
+fn rigid_body_display_name(body_id: i32, rigid_body_names: &[String]) -> String {
+    usize::try_from(body_id.saturating_sub(1))
+        .ok()
+        .and_then(|index| rigid_body_names.get(index))
+        .filter(|name| !name.is_empty())
+        .cloned()
+        .unwrap_or_else(|| format!("id_{body_id}"))
+}
+
 fn rigid_body_statuses(
     frame: &RigidBodyFrame,
     rigid_body_names: &[String],
@@ -1837,21 +2337,13 @@ fn rigid_body_statuses(
     frame
         .bodies
         .iter()
-        .map(|body| {
-            let name = usize::try_from(body.id.saturating_sub(1))
-                .ok()
-                .and_then(|index| rigid_body_names.get(index))
-                .filter(|name| !name.is_empty())
-                .cloned()
-                .unwrap_or_else(|| format!("id_{}", body.id));
-            RigidBodyStatus {
-                id: body.id,
-                name,
-                position_m: vec3_to_array(&body.position_enu_m),
-                quaternion: quat_xyzw_array(&body.attitude),
-                residual: body.residual_mm,
-                tracking_valid: body.tracking_valid,
-            }
+        .map(|body| RigidBodyStatus {
+            id: body.id,
+            name: rigid_body_display_name(body.id, rigid_body_names),
+            position_m: vec3_to_array(&body.position_enu_m),
+            quaternion: quat_xyzw_array(&body.attitude),
+            residual: body.residual_mm,
+            tracking_valid: body.tracking_valid,
         })
         .collect()
 }
@@ -2619,9 +3111,19 @@ fn web_url(bind: SocketAddr) -> String {
 }
 
 fn open_browser(url: &str) {
-    let result = if cfg!(windows) {
-        Command::new("cmd").args(["/C", "start", "", url]).spawn()
-    } else if cfg!(target_os = "macos") {
+    #[cfg(windows)]
+    let result = {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: the GUI-subsystem bridge has no console, and cmd
+        // would otherwise flash one open.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+    };
+    #[cfg(not(windows))]
+    let result = if cfg!(target_os = "macos") {
         Command::new("open").arg(url).spawn()
     } else {
         Command::new("xdg-open").arg(url).spawn()
@@ -2730,8 +3232,14 @@ mod tests {
             ExternalOdometryEstimators::new(estimator_config(&StreamConfig::default()));
         let body = test_observation(7, 1.0, 2.0, 3.0, qtm_quaternion(0.1, -0.2, 0.3, 0.9), true);
 
-        let payload = encode_external_odometry(&body, 123_456, 42, &mut estimators);
+        let (_, payload) = encode_external_odometry(&body, 123_456, 42, &mut estimators);
         assert_eq!(payload.len(), 64);
+        assert_eq!(
+            payload.len(),
+            external_odometry_topic_info()
+                .payload_size
+                .expect("catalog payload size"),
+        );
 
         let data = ExternalOdometryData(payload.try_into().unwrap());
         assert_eq!(data.timestamp_us(), 123_456);
@@ -2768,7 +3276,8 @@ mod tests {
             1_000_000,
             1,
             &mut estimators,
-        );
+        )
+        .1;
         let first = ExternalOdometryData(first.try_into().unwrap());
         assert!(
             !first
@@ -2781,7 +3290,8 @@ mod tests {
             1_100_000,
             2,
             &mut estimators,
-        );
+        )
+        .1;
         let second = ExternalOdometryData(second.try_into().unwrap());
         assert!(
             second
@@ -2799,7 +3309,8 @@ mod tests {
             1_150_000,
             3,
             &mut estimators,
-        );
+        )
+        .1;
         let dropout = ExternalOdometryData(dropout.try_into().unwrap());
         assert_eq!(dropout.status(), ExternalOdometryStatus::ExtrapolatedShort);
         assert!(
@@ -2819,7 +3330,8 @@ mod tests {
             1_300_000,
             4,
             &mut estimators,
-        );
+        )
+        .1;
         let reacquired = ExternalOdometryData(reacquired.try_into().unwrap());
         assert!(
             !reacquired
@@ -2832,7 +3344,8 @@ mod tests {
             1_400_000,
             5,
             &mut estimators,
-        );
+        )
+        .1;
         let valid_again = ExternalOdometryData(valid_again.try_into().unwrap());
         assert!(
             valid_again
@@ -2844,6 +3357,150 @@ mod tests {
             "estimated velocity x = {}",
             valid_again.linear_velocity_enu_m_s().x()
         );
+    }
+
+    #[test]
+    fn default_topics_use_synapse_fbs_catalog_keys() {
+        let config = AppConfig::default();
+
+        assert_eq!(config.zenoh.topic, "qualisys/mocap");
+        assert_eq!(config.zenoh.external_odometry_topic_prefix, "");
+        assert_eq!(
+            config.zenoh.rigid_body_names_topic,
+            "qualisys/rigid_body_names"
+        );
+        assert_eq!(external_odometry_topic("", "cub1"), "cub1/external_pose");
+        assert_eq!(
+            external_odometry_topic("field_lab/", "cub1"),
+            "field_lab/cub1/external_pose"
+        );
+    }
+
+    #[test]
+    fn rigid_body_names_become_sanitized_key_namespaces() {
+        assert_eq!(sanitize_key_segment("Cub 1"), "cub_1");
+        assert_eq!(sanitize_key_segment("  Drone--Alpha  "), "drone_alpha");
+        assert_eq!(sanitize_key_segment("π"), "");
+
+        let namespaces = external_odometry_namespaces(&[
+            "Cub 1".to_owned(),
+            "cub_1".to_owned(),
+            String::new(),
+            "42".to_owned(),
+            "cmd".to_owned(),
+        ]);
+        assert_eq!(namespaces[&1], "cub_1");
+        assert_eq!(namespaces[&2], "cub_1_2");
+        assert_eq!(namespaces[&3], "body_3");
+        assert_eq!(namespaces[&4], "body_4");
+        assert_eq!(namespaces[&5], "body_5");
+    }
+
+    #[test]
+    fn namespace_dedupe_never_reuses_a_fallback_collision() {
+        // Body 3's "<name>_<id>" fallback would collide with body 1's
+        // namespace; the dedupe must keep extending until unique.
+        let namespaces = external_odometry_namespaces(&[
+            "Drone 3".to_owned(),
+            "Drone".to_owned(),
+            "Drone!".to_owned(),
+        ]);
+        assert_eq!(namespaces[&1], "drone_3");
+        assert_eq!(namespaces[&2], "drone");
+        assert_eq!(namespaces[&3], "drone_3_2");
+        let unique: BTreeSet<_> = namespaces.values().collect();
+        assert_eq!(unique.len(), namespaces.len());
+
+        // A name shaped like another body's fallback is rejected so it can
+        // never collide with an id missing from the parameter list.
+        let namespaces = external_odometry_namespaces(&["body_7".to_owned(), "body_2".to_owned()]);
+        assert_eq!(namespaces[&1], "body_1");
+        assert_eq!(namespaces[&2], "body_2");
+    }
+
+    #[test]
+    fn legacy_topic_defaults_migrate_to_catalog_keys() {
+        let mut config = AppConfig::default();
+        config.zenoh.topic = "synapse/v1/topic/mocap_frame".to_owned();
+        config.zenoh.external_odometry_topic_prefix =
+            "synapse/v1/topic/external_odometry".to_owned();
+        config.zenoh.rigid_body_names_topic = "synapse/mocap/rigid_body_names".to_owned();
+
+        assert!(migrate_legacy_topics(&mut config));
+        assert_eq!(config.zenoh.topic, "qualisys/mocap");
+        assert_eq!(config.zenoh.external_odometry_topic_prefix, "");
+        assert_eq!(
+            config.zenoh.rigid_body_names_topic,
+            "qualisys/rigid_body_names"
+        );
+
+        config.zenoh.topic = "custom/mocap".to_owned();
+        assert!(!migrate_legacy_topics(&mut config));
+        assert_eq!(config.zenoh.topic, "custom/mocap");
+    }
+
+    #[test]
+    fn subscription_key_expr_covers_all_publication_families() {
+        let mut config = AppConfig::default();
+        assert_eq!(subscription_key_expr(&config), "**");
+
+        // Without odometry the mocap frame and rigid-body-name topics share
+        // the qualisys namespace.
+        config.zenoh.no_external_odometry = true;
+        assert_eq!(subscription_key_expr(&config), "qualisys/**");
+
+        config.zenoh.no_external_odometry = false;
+        config.zenoh.external_odometry_topic_prefix = "qualisys".to_owned();
+        assert_eq!(subscription_key_expr(&config), "qualisys/**");
+
+        config.zenoh.external_odometry_topic_prefix = "elsewhere".to_owned();
+        assert_eq!(subscription_key_expr(&config), "**");
+    }
+
+    #[test]
+    fn publisher_value_contracts_match_synapse_catalog() {
+        assert_eq!(
+            value_contract::encoding_for_topic(mocap_frame_topic_info()),
+            format!(
+                "application/x-flatbuffers;type=synapse.topic.MocapFrame;schema=sha256-128:{}",
+                mocap_frame_topic_info().schema_hash
+            )
+        );
+        assert_eq!(
+            value_contract::encoding_for_topic(external_odometry_topic_info()),
+            format!(
+                "application/x-synapse-struct;type=synapse.topic.ExternalOdometryData;schema=sha256-128:{}",
+                external_odometry_topic_info().schema_hash
+            )
+        );
+    }
+
+    #[test]
+    fn odometry_debug_status_reports_estimate_and_covariance() {
+        let mut estimators =
+            ExternalOdometryEstimators::new(estimator_config(&StreamConfig::default()));
+        let body = test_observation(2, 1.0, 2.0, 3.0, qtm_quaternion(0.0, 0.0, 0.0, 1.0), true);
+        let (estimate, _) = encode_external_odometry(&body, 500_000, 1, &mut estimators);
+
+        let debug = odometry_debug_status(
+            &body,
+            &["one".to_owned(), "two".to_owned()],
+            "two/external_pose".to_owned(),
+            false,
+            &estimate,
+        );
+
+        assert_eq!(debug.id, 2);
+        assert_eq!(debug.name, "two");
+        assert_eq!(debug.topic, "two/external_pose");
+        assert!(!debug.subscribed);
+        assert_eq!(debug.status, "Filtered");
+        assert!(debug.flags.contains(&"PositionValid".to_owned()));
+        assert_eq!(debug.position_enu_m, [1.0, 2.0, 3.0]);
+        // Initial position variance comes straight from the configured
+        // measurement noise.
+        let position_variance = debug.covariance[6][6];
+        assert!((position_variance - 0.002_f64.powi(2)).abs() < 1.0e-12);
     }
 
     fn test_observation(

@@ -2639,9 +2639,9 @@ dependencies = [
 
 [[package]]
 name = "synapse_fbs"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4f5a8d12a3bc79d0d8470a225a918f32faacf03ec22845aaf77024cb0b8056"
+checksum = "5130c32ec60758f7d8e2d5303808b8bf5d24ca5c38c20ac9c7382f5001115c95"
 dependencies = [
  "flatbuffers",
 ]
@@ -2661,6 +2661,7 @@ dependencies = [
  "tiny_http",
  "toml",
  "ureq",
+ "windows-sys 0.60.2",
  "zenoh",
 ]
 

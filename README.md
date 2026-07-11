@@ -47,15 +47,23 @@ Useful defaults can also come from environment variables:
 QUALISYS_HOST=127.0.0.1 cargo run --bin synapse-qualisys-bridge
 ```
 
-The default Zenoh key expression is `synapse/v1/topic/mocap_frame`. Run
+Topic keys follow the synapse_fbs 0.6 topic catalog: raw mocap frames publish
+on `qualisys/mocap` by default, and per-rigid-body external odometry publishes
+on `<body_name>/external_pose` in each tracked vehicle's own namespace. Run
 `cargo run --bin synapse-qualisys-bridge -- --help` for all options.
 
 Example subscriber configuration from another machine:
 
 ```text
 endpoint: udp/<bridge-pc-ip>:7447
-key expression: synapse/v1/topic/**
+key expression: qualisys/mocap        # raw frames
+key expression: <body_name>/external_pose   # estimator input for one vehicle
 ```
+
+Every published Zenoh value carries the synapse_fbs 0.6 value contract
+encoding
+(`<media-type>;type=<wire-type>;schema=sha256-128:<hash>`), so catalog-aware
+consumers can validate payloads before decoding.
 
 `zenoh.listen` and `zenoh.connect` can each contain multiple endpoints separated
 by commas, semicolons, or whitespace.
@@ -96,7 +104,7 @@ quality, so a finite pose remains available for visualization while derived
 odometry reports `Degraded` rather than silently appearing lost.
 
 The bridge publishes a small JSON ID/name mapping at startup and every five
-seconds on `synapse/mocap/rigid_body_names` (configurable with
+seconds on `qualisys/rigid_body_names` (configurable with
 `zenoh.rigid_body_names_topic`). This lets visualizers select a body by its QTM
 name instead of assuming a numeric ID:
 
@@ -108,23 +116,34 @@ The bridge also publishes fixed-layout per-rigid-body external odometry payloads
 by default:
 
 ```text
-synapse/v1/topic/external_odometry/<rigid_body_id>
+[<prefix>/]<body_name>/external_pose
 ```
 
-Each payload is the 136-byte `synapse.topic.ExternalOdometryData` struct:
+`<body_name>` is the QTM rigid-body name sanitized to a lowercase snake_case
+Zenoh key segment (`Cub 1` becomes `cub_1`), with a `body_<id>` fallback for
+empty or unusable names, matching the synapse_fbs convention that bridges
+write estimator inputs into the consuming vehicle's own namespace. Use
+`--external-odometry-topic-prefix` to prepend a deployment namespace (for
+example `field_lab`), or `--no-external-odometry` to disable these topics.
+
+Each payload is the 64-byte `synapse.topic.ExternalOdometryData` struct:
 timestamp, position in ENU meters, attitude as body-FLU to ENU quaternion,
 linear velocity in ENU meters per second, and angular velocity in body-FLU
-radians per second. The derived odometry path is demand-driven: the bridge only
-runs the per-body estimator and publishes these payloads when Zenoh reports a
-matching subscriber for that body's odometry key expression. Subscribing only
-to raw mocap frames does not force odometry work. The estimator is a 12D
+radians per second. The estimator runs for every tracked body so the
+dashboard's External Odometry panel can display the live Kalman filter state
+(position, attitude, velocities, and the full 12x12 covariance); the Zenoh
+publication stays demand-driven, only sending a body's payloads while Zenoh
+reports a matching subscriber for its key expression. The estimator is a 12D
 Lie/error-state EKF prediction model generated from the
 `Estimation.Examples.MocapExternalOdometryIEKF` Modelica example in the pinned
 `third_party/modelica_models` submodule. It estimates position, attitude,
 linear velocity, and angular velocity without a centered least-squares fit that
 would add lookahead latency. State resets across dropped, out-of-sync, invalid,
-or too-sparse samples. Use `--external-odometry-topic-prefix` to change the
-prefix, or `--no-external-odometry` to disable these topics.
+or too-sparse samples.
+
+Configurations saved by bridge versions before the synapse_fbs 0.6 update keep
+working: the legacy `synapse/v1/topic/...` default key expressions are migrated
+to the catalog keys on startup, while custom key expressions are left as-is.
 
 Regenerate the estimator kernel after updating Rumoca or `modelica_models`:
 
@@ -161,6 +180,13 @@ On Windows, the installer is per-user and creates Start Menu entries for:
 - opening the dashboard
 - opening the log directory
 - editing `bridge.toml`
+
+The Windows binary is a GUI-subsystem executable, so launching it never shows
+a console window; log output goes to the dashboard and the log file (running
+it from a terminal still prints there). When the dashboard opens, the bridge
+launches it as a dedicated Edge or Chrome app window, and closing that window
+shuts the bridge down. If neither browser is found the dashboard opens in the
+default browser without that lifecycle coupling.
 
 It can optionally add a startup shortcut so the bridge starts when the user
 signs in. The installed dashboard checks GitHub releases for newer installer
