@@ -22,6 +22,7 @@ connect = ""
 listen = "udp/0.0.0.0:7447,tcp/0.0.0.0:7447"
 topic = "synapse/v1/topic/mocap_frame"
 external_odometry_topic_prefix = "synapse/v1/topic/external_odometry"
+rigid_body_names_topic = "synapse/mocap/rigid_body_names"
 no_external_odometry = false
 admin_query_timeout_ms = 1000
 

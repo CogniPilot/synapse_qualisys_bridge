@@ -63,6 +63,8 @@ pub struct MocapMeasurement {
     pub position_enu_m: [f64; 3],
     pub attitude_wxyz: [f64; 4],
     pub tracking_valid: bool,
+    /// QTM delivered a finite pose, but reported transport quality loss.
+    pub quality_degraded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -169,18 +171,23 @@ impl MocapExternalOdometryEstimator {
             self.initialize(measurement);
             return self.estimate(
                 measurement.timestamp_us,
-                ExternalOdometryStatus::Filtered,
+                measurement_status(&measurement),
                 false,
                 false,
             );
         }
 
-        let dt_us = measurement.timestamp_us.saturating_sub(self.timestamp_us);
+        // Compare against the last accepted measurement, not the last prediction.  During a
+        // tracking outage `timestamp_us` continues advancing, while this timestamp deliberately
+        // remains at the last observed pose.
+        let dt_us = measurement
+            .timestamp_us
+            .saturating_sub(self.last_mocap_timestamp_us);
         if dt_us > self.config.max_gap_us {
             self.initialize(measurement);
             return self.estimate(
                 measurement.timestamp_us,
-                ExternalOdometryStatus::Filtered,
+                measurement_status(&measurement),
                 false,
                 false,
             );
@@ -210,7 +217,7 @@ impl MocapExternalOdometryEstimator {
             self.twist_valid = true;
             self.estimate(
                 measurement.timestamp_us,
-                ExternalOdometryStatus::Filtered,
+                measurement_status(&measurement),
                 false,
                 false,
             )
@@ -234,12 +241,12 @@ impl MocapExternalOdometryEstimator {
             return ExternalOdometryEstimate::lost(measurement.timestamp_us);
         }
 
-        self.predict_to(measurement.timestamp_us);
         self.frames_since_last_mocap_count = self.frames_since_last_mocap_count.saturating_add(1);
         let extrapolation_us = measurement
             .timestamp_us
             .saturating_sub(self.last_mocap_timestamp_us);
         if extrapolation_us <= self.config.max_gap_us {
+            self.predict_to(measurement.timestamp_us);
             self.estimate(
                 measurement.timestamp_us,
                 ExternalOdometryStatus::ExtrapolatedShort,
@@ -247,6 +254,15 @@ impl MocapExternalOdometryEstimator {
                 false,
             )
         } else {
+            // Propagate at most to the loss horizon once.  Continuing to integrate an old twist
+            // after QTM has declared the body lost makes a stale estimate appear to be live.
+            let loss_horizon = self
+                .last_mocap_timestamp_us
+                .saturating_add(self.config.max_gap_us);
+            self.predict_to(loss_horizon);
+            self.y[LINEAR_VELOCITY_OFFSET..LINEAR_VELOCITY_OFFSET + 3].fill(0.0);
+            self.y[ANGULAR_VELOCITY_OFFSET..ANGULAR_VELOCITY_OFFSET + 3].fill(0.0);
+            self.timestamp_us = measurement.timestamp_us.max(self.timestamp_us);
             self.twist_valid = false;
             self.estimate(
                 measurement.timestamp_us,
@@ -499,6 +515,14 @@ impl MocapExternalOdometryEstimator {
     }
 }
 
+fn measurement_status(measurement: &MocapMeasurement) -> ExternalOdometryStatus {
+    if measurement.quality_degraded {
+        ExternalOdometryStatus::Degraded
+    } else {
+        ExternalOdometryStatus::Filtered
+    }
+}
+
 fn covariance_index(row: usize, col: usize) -> usize {
     COVARIANCE_OFFSET + col * TANGENT_LEN + row
 }
@@ -719,6 +743,7 @@ mod tests {
             position_enu_m: [0.0, 0.0, 0.0],
             attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
             tracking_valid: true,
+            quality_degraded: false,
         });
         estimator.y[LINEAR_VELOCITY_OFFSET] = 2.0;
 
@@ -742,6 +767,7 @@ mod tests {
             position_enu_m: [0.0, 0.0, 0.0],
             attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
             tracking_valid: true,
+            quality_degraded: false,
         });
         assert!(
             !first
@@ -754,6 +780,7 @@ mod tests {
             position_enu_m: [0.1, 0.0, 0.0],
             attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
             tracking_valid: true,
+            quality_degraded: false,
         });
 
         assert!(
@@ -777,12 +804,14 @@ mod tests {
             position_enu_m: [0.0, 0.0, 0.0],
             attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
             tracking_valid: true,
+            quality_degraded: false,
         });
         estimator.update(MocapMeasurement {
             timestamp_us: 1_100_000,
             position_enu_m: [0.1, 0.0, 0.0],
             attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
             tracking_valid: true,
+            quality_degraded: false,
         });
 
         let dropout = estimator.update(MocapMeasurement {
@@ -790,6 +819,7 @@ mod tests {
             position_enu_m: [0.0, 0.0, 0.0],
             attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
             tracking_valid: false,
+            quality_degraded: false,
         });
 
         assert_eq!(dropout.status, ExternalOdometryStatus::ExtrapolatedShort);
@@ -799,6 +829,48 @@ mod tests {
             "extrapolated x = {}",
             dropout.position_enu_m[0]
         );
+    }
+
+    #[test]
+    fn lost_pose_freezes_at_the_extrapolation_horizon_and_reacquires() {
+        let mut estimator =
+            MocapExternalOdometryEstimator::new(MocapExternalOdometryEstimatorConfig::default());
+        for (timestamp_us, x) in [(1_000_000, 0.0), (1_050_000, 0.05)] {
+            estimator.update(MocapMeasurement {
+                timestamp_us,
+                position_enu_m: [x, 0.0, 0.0],
+                attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
+                tracking_valid: true,
+                quality_degraded: false,
+            });
+        }
+        let lost = estimator.update(MocapMeasurement {
+            timestamp_us: 1_250_000,
+            position_enu_m: [0.0, 0.0, 0.0],
+            attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
+            tracking_valid: false,
+            quality_degraded: false,
+        });
+        let still_lost = estimator.update(MocapMeasurement {
+            timestamp_us: 2_000_000,
+            position_enu_m: [0.0, 0.0, 0.0],
+            attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
+            tracking_valid: false,
+            quality_degraded: false,
+        });
+        assert_eq!(lost.status, ExternalOdometryStatus::Lost);
+        assert_eq!(lost.position_enu_m, still_lost.position_enu_m);
+        assert_eq!(still_lost.linear_velocity_enu_m_s, [0.0; 3]);
+
+        let reacquired = estimator.update(MocapMeasurement {
+            timestamp_us: 2_050_000,
+            position_enu_m: [5.0, 0.0, 0.0],
+            attitude_wxyz: [1.0, 0.0, 0.0, 0.0],
+            tracking_valid: true,
+            quality_degraded: false,
+        });
+        assert_eq!(reacquired.status, ExternalOdometryStatus::Filtered);
+        assert!((reacquired.position_enu_m[0] - 5.0).abs() < 1.0e-6);
     }
 
     #[test]
